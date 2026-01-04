@@ -120,13 +120,47 @@ cp .env.example .env
 # Edit .env with your API keys
 
 # Start infrastructure (PostgreSQL, Redis)
-docker-compose up -d
+docker compose up -d
+
+# Wait for services to be healthy
+docker compose ps
 
 # Install Python dependencies
 pip install -e .
 
+# Run database migrations
+alembic upgrade head
+
 # Run the tracker
 python -m src.main
+```
+
+### Docker Services
+
+The development stack includes:
+
+| Service | Port | Description |
+|---------|------|-------------|
+| PostgreSQL 15 | 5432 | Primary database |
+| Redis 7 | 6379 | Caching and pub/sub |
+| Adminer | 8080 | Database admin UI (optional) |
+| RedisInsight | 5540 | Redis admin UI (optional) |
+
+```bash
+# Start core services only
+docker compose up -d
+
+# Start with development tools (Adminer, RedisInsight)
+docker compose --profile tools up -d
+
+# View logs
+docker compose logs -f
+
+# Stop all services
+docker compose down
+
+# Stop and remove volumes (reset data)
+docker compose down -v
 ```
 
 ### Configuration
