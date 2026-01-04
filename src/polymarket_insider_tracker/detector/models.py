@@ -1,5 +1,8 @@
 """Data models for the detector module."""
 
+from __future__ import annotations
+
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -141,5 +144,87 @@ class SizeAnomalySignal:
             "is_niche_market": self.is_niche_market,
             "confidence": self.confidence,
             "factors": self.factors,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+@dataclass(frozen=True)
+class RiskAssessment:
+    """Combined risk assessment aggregating all signal types.
+
+    This represents the final scoring output that determines whether
+    a trade should trigger an alert, combining signals from multiple
+    detectors with configurable weights.
+
+    Attributes:
+        trade_event: The original trade event being assessed.
+        wallet_address: The trader's wallet address.
+        market_id: The market condition ID.
+        fresh_wallet_signal: Signal from fresh wallet detector, if triggered.
+        size_anomaly_signal: Signal from size anomaly detector, if triggered.
+        signals_triggered: Count of how many signal types fired.
+        weighted_score: Final weighted combination of all signals (0.0 to 1.0).
+        should_alert: Whether this assessment meets alert threshold.
+        assessment_id: Unique identifier for this assessment.
+        timestamp: When this assessment was generated.
+    """
+
+    trade_event: TradeEvent
+    wallet_address: str
+    market_id: str
+
+    # Individual signals (None if not triggered)
+    fresh_wallet_signal: FreshWalletSignal | None
+    size_anomaly_signal: SizeAnomalySignal | None
+
+    # Combined scoring
+    signals_triggered: int
+    weighted_score: float
+    should_alert: bool
+
+    # Metadata
+    assessment_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def is_high_risk(self) -> bool:
+        """Return True if weighted score exceeds 0.7."""
+        return self.weighted_score >= 0.7
+
+    @property
+    def is_very_high_risk(self) -> bool:
+        """Return True if weighted score exceeds 0.85."""
+        return self.weighted_score >= 0.85
+
+    @property
+    def trade_size_usdc(self) -> Decimal:
+        """Return the trade size in USDC (notional value)."""
+        return self.trade_event.notional_value
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to dictionary for Redis stream publishing."""
+        return {
+            "assessment_id": self.assessment_id,
+            "wallet_address": self.wallet_address,
+            "market_id": self.market_id,
+            "trade_id": self.trade_event.trade_id,
+            "trade_size": str(self.trade_size_usdc),
+            "trade_side": self.trade_event.side,
+            "trade_price": str(self.trade_event.price),
+            "signals_triggered": self.signals_triggered,
+            "weighted_score": self.weighted_score,
+            "should_alert": self.should_alert,
+            "has_fresh_wallet_signal": self.fresh_wallet_signal is not None,
+            "has_size_anomaly_signal": self.size_anomaly_signal is not None,
+            "fresh_wallet_confidence": (
+                self.fresh_wallet_signal.confidence
+                if self.fresh_wallet_signal
+                else None
+            ),
+            "size_anomaly_confidence": (
+                self.size_anomaly_signal.confidence
+                if self.size_anomaly_signal
+                else None
+            ),
             "timestamp": self.timestamp.isoformat(),
         }
