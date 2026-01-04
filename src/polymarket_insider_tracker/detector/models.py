@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from polymarket_insider_tracker.ingestor.models import TradeEvent
+from polymarket_insider_tracker.ingestor.models import MarketMetadata, TradeEvent
 from polymarket_insider_tracker.profiler.models import WalletProfile
 
 
@@ -67,6 +67,78 @@ class FreshWalletSignal:
             "wallet_nonce": self.wallet_profile.nonce,
             "wallet_age_hours": self.wallet_profile.age_hours,
             "wallet_is_fresh": self.wallet_profile.is_fresh,
+            "confidence": self.confidence,
+            "factors": self.factors,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+@dataclass(frozen=True)
+class SizeAnomalySignal:
+    """Signal emitted when a trade has unusually large position size.
+
+    This signal is generated when a trade's size significantly impacts
+    the market volume or order book depth, indicating potential informed
+    trading activity.
+
+    Attributes:
+        trade_event: The original trade event that triggered this signal.
+        market_metadata: Metadata about the market being traded.
+        volume_impact: Trade size as fraction of 24h volume (0.0 if unknown).
+        book_impact: Trade size as fraction of order book depth (0.0 if unknown).
+        is_niche_market: Whether the market is considered niche/low-volume.
+        confidence: Overall confidence score (0.0 to 1.0).
+        factors: Individual factor scores contributing to confidence.
+        timestamp: When this signal was generated.
+    """
+
+    trade_event: TradeEvent
+    market_metadata: MarketMetadata
+    volume_impact: float
+    book_impact: float
+    is_niche_market: bool
+    confidence: float
+    factors: dict[str, float]
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def wallet_address(self) -> str:
+        """Return the wallet address from the trade event."""
+        return self.trade_event.wallet_address
+
+    @property
+    def market_id(self) -> str:
+        """Return the market ID from the trade event."""
+        return self.trade_event.market_id
+
+    @property
+    def trade_size_usdc(self) -> Decimal:
+        """Return the trade size in USDC (notional value)."""
+        return self.trade_event.notional_value
+
+    @property
+    def is_high_confidence(self) -> bool:
+        """Return True if confidence exceeds 0.7."""
+        return self.confidence >= 0.7
+
+    @property
+    def is_very_high_confidence(self) -> bool:
+        """Return True if confidence exceeds 0.85."""
+        return self.confidence >= 0.85
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to dictionary for Redis stream publishing."""
+        return {
+            "wallet_address": self.wallet_address,
+            "market_id": self.market_id,
+            "trade_id": self.trade_event.trade_id,
+            "trade_size": str(self.trade_size_usdc),
+            "trade_side": self.trade_event.side,
+            "trade_price": str(self.trade_event.price),
+            "market_category": self.market_metadata.category,
+            "volume_impact": self.volume_impact,
+            "book_impact": self.book_impact,
+            "is_niche_market": self.is_niche_market,
             "confidence": self.confidence,
             "factors": self.factors,
             "timestamp": self.timestamp.isoformat(),
