@@ -1,1 +1,1 @@
-"""Tests for storage module."""
+"""Tests for the storage layer."""
