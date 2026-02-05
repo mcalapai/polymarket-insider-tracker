@@ -174,9 +174,9 @@ class RiskScorer:
         # Determine if should alert (before dedup check)
         meets_threshold = weighted_score >= self._alert_threshold
 
-        # Check deduplication
+        # Check deduplication (disabled when dedup window <= 0, e.g. offline scans/backtests)
         is_duplicate = False
-        if meets_threshold:
+        if meets_threshold and self._dedup_window > 0:
             is_duplicate = await self._check_and_set_dedup(
                 bundle.wallet_address,
                 bundle.market_id,

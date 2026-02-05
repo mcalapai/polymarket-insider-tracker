@@ -406,8 +406,15 @@ Detect manipulative order behavior using **order lifecycle events**:
 
 ### Implementation steps
 1. **Confirm available order event feeds**
-   - Identify the Polymarket WebSocket topic/type(s) for order events and cancels.
-   - Extend `TradeStreamHandler` into a more general `MarketStreamHandler` that can subscribe to multiple event types.
+   - Polymarket CLOB WebSockets expose two channels:
+     - `market` channel (public): `book`, `price_change`, `last_trade_price` (order book/price deltas).
+     - `user` channel (authenticated): order updates for **your own account** (placements/updates/cancellations/fills).
+   - For insider/spoofing detection across arbitrary wallets, the `user` channel is not sufficient (it is user-scoped).
+     The production approach is therefore:
+     - ingest `market` channel deltas (`book` + `price_change`) for globally-observable lifecycle changes, and
+     - attribute orders by fetching order details via Level-2 HTTP endpoints (requires L2 auth).
+   - Keep `TradeStreamHandler` for the trade activity feed and add a separate CLOB market stream handler for book deltas
+     (this matches Polymarket’s channel separation and keeps responsibilities clear).
 
 2. **Add models**
    - Add `OrderEvent` / `CancelEvent` dataclasses in `ingestor/models.py` (or a new file under `ingestor/` if models become too large).

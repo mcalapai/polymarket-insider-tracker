@@ -519,9 +519,14 @@ class RiskAssessment:
     wallet_address: str
     market_id: str
 
+    # Combined scoring
+    signals_triggered: int
+    weighted_score: float
+    should_alert: bool
+
     # Individual signals (None if not triggered)
-    fresh_wallet_signal: FreshWalletSignal | None
-    size_anomaly_signal: SizeAnomalySignal | None
+    fresh_wallet_signal: FreshWalletSignal | None = None
+    size_anomaly_signal: SizeAnomalySignal | None = None
     sniper_cluster_signal: SniperClusterSignal | None = None
     coentry_signal: CoEntryCorrelationSignal | None = None
     funding_signal: FundingChainSignal | None = None
@@ -533,11 +538,6 @@ class RiskAssessment:
     rapid_cancel_signal: RapidCancelSignal | None = None
     book_impact_without_fill_signal: BookImpactWithoutFillSignal | None = None
     model_score_signal: ModelScoreSignal | None = None
-
-    # Combined scoring
-    signals_triggered: int
-    weighted_score: float
-    should_alert: bool
 
     # Metadata
     assessment_id: str = field(default_factory=lambda: str(uuid.uuid4()))

@@ -556,6 +556,13 @@ class ScanSettings(BaseSettings):
         alias="SCAN_ALLOW_NON_HISTORICAL_BOOK_DEPTH",
         description="If true, uses current orderbook depth when historical depth snapshots are unavailable",
     )
+    pre_move_weight: float = Field(
+        default=0.10,
+        alias="SCAN_PRE_MOVE_WEIGHT",
+        ge=0.0,
+        le=1.0,
+        description="Weight for PreMoveSignal when ranking scan/backtest results",
+    )
 
     artifacts_dir: Path = Field(
         default=Path("artifacts"),
@@ -824,6 +831,7 @@ class Settings(BaseSettings):
             "scan": {
                 "embedding_model": self.scan.embedding_model or "(not set)",
                 "top_k_markets": str(self.scan.top_k_markets),
+                "pre_move_weight": str(self.scan.pre_move_weight),
             },
             "discord_enabled": str(self.discord.enabled),
             "telegram_enabled": str(self.telegram.enabled),

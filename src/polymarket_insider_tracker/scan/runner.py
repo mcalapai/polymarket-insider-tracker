@@ -10,6 +10,7 @@ This module implements the `scan --query "..."` command:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import uuid
@@ -23,8 +24,15 @@ from redis.asyncio import Redis
 from polymarket_insider_tracker.config import Settings
 from polymarket_insider_tracker.detector.digit_distribution import DigitDistributionDetector
 from polymarket_insider_tracker.detector.fresh_wallet import FreshWalletDetector
-from polymarket_insider_tracker.detector.pre_move import PreMoveDetector
-from polymarket_insider_tracker.detector.scorer import RiskScorer, SignalBundle
+from polymarket_insider_tracker.detector.models import (
+    CoEntryCorrelationSignal,
+    FundingChainSignal,
+    PreMoveSignal,
+    RiskAssessment,
+    SniperClusterSignal,
+)
+from polymarket_insider_tracker.detector.pre_move import PreMoveDetector, PreMoveDetectorError
+from polymarket_insider_tracker.detector.scorer import DEFAULT_WEIGHTS, RiskScorer, SignalBundle
 from polymarket_insider_tracker.detector.size_anomaly import LiquidityInputs, SizeAnomalyDetector
 from polymarket_insider_tracker.detector.sniper import SniperDetector
 from polymarket_insider_tracker.detector.trade_size_outlier import TradeSizeOutlierDetector
@@ -248,18 +256,32 @@ async def run_scan(
         outlier = TradeSizeOutlierDetector(hist_cache)
         digits = DigitDistributionDetector(digit_cache)
         slicing = TradeSlicingDetector(flow_cache, hist_cache)
-        scorer = RiskScorer(redis)
+        # Offline scans/backtests must not deduplicate.
+        scorer_trade_time = RiskScorer(redis, dedup_window_seconds=0, key_prefix=f"{prefix}dedup:")
+        future_weights = DEFAULT_WEIGHTS.copy()
+        future_weights["pre_move"] = float(settings.scan.pre_move_weight)
+        scorer_with_future = RiskScorer(
+            redis,
+            weights=future_weights,
+            dedup_window_seconds=0,
+            key_prefix=f"{prefix}dedup_future:",
+        )
 
         # Pre-move computed as a second pass after all price bars are present.
         pre_move = PreMoveDetector()
 
-        # Build entry events for sniper/co-entry.
+        # Build entry events for sniper/co-entry (time-consistent: clustering runs periodically
+        # over entries observed up to the current trade time).
         from polymarket_insider_tracker.detector.sniper import MarketEntry as SniperMarketEntry
 
         entries: list[SniperMarketEntry] = []
         market_first_trade: dict[str, datetime] = {}
         market_wallet_seen: set[tuple[str, str]] = set()
         market_entry_rank: dict[str, int] = {}
+        entries_window_start_idx = 0
+        last_sniper_run_at: datetime | None = None
+        wallet_sniper: dict[str, SniperClusterSignal] = {}
+        wallet_coentry: dict[str, CoEntryCorrelationSignal] = {}
 
         async with db.get_async_session() as session:
             liq_repo = LiquiditySnapshotRepository(session)
@@ -268,8 +290,78 @@ async def run_scan(
             wallet_repo = WalletSnapshotRepository(session)
             price_repo = MarketPriceBarRepository(session)
 
-            flagged_records: list[dict[str, object]] = []
-            for t in trades:
+            funding_cache: dict[str, FundingChainSignal] = {}
+            bundles_by_trade: dict[str, SignalBundle] = {}
+            trade_time_assessments: dict[str, RiskAssessment] = {}
+            pre_move_signals: dict[str, PreMoveSignal] = {}
+            future_assessments: dict[str, RiskAssessment] = {}
+
+            async def compute_funding_signal(*, wallet_address: str, as_of: datetime) -> FundingChainSignal:
+                chain = await funding.trace(session, address=wallet_address, as_of=as_of)
+                await funding.persist_relationships(
+                    session,
+                    chain,
+                    shares_funder_time_band_minutes=settings.funding.shares_funder_time_band_minutes,
+                    funding_burst_min_wallets=settings.funding.funding_burst_min_wallets,
+                )
+                suspiciousness = funding.get_suspiciousness_score(chain)
+                return FundingChainSignal(
+                    wallet_address=wallet_address.lower(),
+                    origin_address=chain.origin_address.lower(),
+                    origin_type=chain.origin_type,
+                    hop_count=chain.hop_count,
+                    suspiciousness=suspiciousness,
+                    confidence=suspiciousness,
+                )
+
+            async def maybe_run_sniper(*, now: datetime) -> None:
+                nonlocal entries_window_start_idx, last_sniper_run_at, wallet_sniper, wallet_coentry
+                if not entries:
+                    return
+                if last_sniper_run_at is not None:
+                    if (now - last_sniper_run_at).total_seconds() < float(settings.sniper.run_interval_seconds):
+                        return
+
+                last_sniper_run_at = now
+                window_start = now - timedelta(days=settings.sniper.window_days)
+                while entries_window_start_idx < len(entries) and entries[entries_window_start_idx].timestamp < window_start:
+                    entries_window_start_idx += 1
+                window_entries = entries[entries_window_start_idx:]
+                if not window_entries:
+                    wallet_sniper = {}
+                    wallet_coentry = {}
+                    return
+
+                clusters, cluster_signals = await asyncio.to_thread(
+                    sniper.detect_clusters,
+                    window_entries,
+                    window_start=window_start,
+                    window_end=now,
+                )
+                _ = clusters  # clusters are persisted in live mode; scan uses wallet-level signals only.
+                coentry_signals = await asyncio.to_thread(
+                    sniper.detect_coentry,
+                    window_entries,
+                    window_start=window_start,
+                    window_end=now,
+                )
+
+                best_sniper: dict[str, SniperClusterSignal] = {}
+                for s in cluster_signals:
+                    prev = best_sniper.get(s.wallet_address)
+                    if prev is None or s.confidence > prev.confidence:
+                        best_sniper[s.wallet_address] = s
+                best_co: dict[str, CoEntryCorrelationSignal] = {}
+                for s in coentry_signals:
+                    prev = best_co.get(s.wallet_address)
+                    if prev is None or s.confidence > prev.confidence:
+                        best_co[s.wallet_address] = s
+
+                wallet_sniper = best_sniper
+                wallet_coentry = best_co
+
+            commit_every = 1000
+            for idx, t in enumerate(trades, start=1):
                 total_considered += 1
                 # Update rolling caches (deterministic for this replay).
                 await volume_cache.record_trade_notional(t.market_id, ts=t.ts, notional_usdc=t.notional_usdc)
@@ -298,6 +390,8 @@ async def run_scan(
                         )
                     )
 
+                await maybe_run_sniper(now=t.ts)
+
                 # Recreate TradeEvent for detector compatibility.
                 from polymarket_insider_tracker.ingestor.models import TradeEvent
 
@@ -314,22 +408,23 @@ async def run_scan(
                     asset_id=t.asset_id,
                 )
 
-                wallet_snapshot = await wallet_analyzer.analyze(t.wallet_address, as_of=t.ts)
-                await wallet_repo.upsert(
-                    WalletSnapshotDTO(
-                        address=wallet_snapshot.address,
-                        as_of_block_number=wallet_snapshot.as_of_block_number,
-                        as_of=wallet_snapshot.as_of,
-                        nonce_as_of=wallet_snapshot.nonce_as_of,
-                        first_funding_at=wallet_snapshot.first_funding_at,
-                        age_hours_as_of=Decimal(str(wallet_snapshot.age_hours_as_of)),
-                        matic_balance_wei_as_of=wallet_snapshot.matic_balance_wei_as_of,
-                        usdc_balance_units_as_of=wallet_snapshot.usdc_balance_units_as_of,
-                        computed_at=wallet_snapshot.computed_at,
+                fresh_signal = None
+                if t.notional_usdc >= settings.fresh_wallet.min_trade_notional_usdc:
+                    wallet_snapshot = await wallet_analyzer.analyze(t.wallet_address, as_of=t.ts)
+                    await wallet_repo.upsert(
+                        WalletSnapshotDTO(
+                            address=wallet_snapshot.address,
+                            as_of_block_number=wallet_snapshot.as_of_block_number,
+                            as_of=wallet_snapshot.as_of,
+                            nonce_as_of=wallet_snapshot.nonce_as_of,
+                            first_funding_at=wallet_snapshot.first_funding_at,
+                            age_hours_as_of=Decimal(str(wallet_snapshot.age_hours_as_of)),
+                            matic_balance_wei_as_of=wallet_snapshot.matic_balance_wei_as_of,
+                            usdc_balance_units_as_of=wallet_snapshot.usdc_balance_units_as_of,
+                            computed_at=wallet_snapshot.computed_at,
+                        )
                     )
-                )
-
-                fresh_signal = await fresh.analyze(trade_event, wallet_snapshot=wallet_snapshot)
+                    fresh_signal = await fresh.analyze(trade_event, wallet_snapshot=wallet_snapshot)
 
                 # Liquidity inputs (strict).
                 liq = await liq_repo.get_latest_before(
@@ -365,16 +460,35 @@ async def run_scan(
                 digit_signal = await digits.analyze(trade_event)
                 slicing_signal = await slicing.analyze(trade_event)
 
-                # Sniper/co-entry computed after full pass; placeholders for now.
+                wallet = t.wallet_address.lower()
+                sniper_signal = wallet_sniper.get(wallet)
+                coentry_signal = wallet_coentry.get(wallet)
+
                 bundle = SignalBundle(
                     trade_event=trade_event,
                     fresh_wallet_signal=fresh_signal,
                     size_anomaly_signal=size_signal,
+                    sniper_cluster_signal=sniper_signal,
+                    coentry_signal=coentry_signal,
                     trade_size_outlier_signal=outlier_signal,
                     digit_distribution_signal=digit_signal,
                     trade_slicing_signal=slicing_signal,
                 )
-                assessment = await scorer.assess(bundle)
+                assessment = await scorer_trade_time.assess(bundle)
+
+                # On-demand funding trace for high-risk candidates (strict: trace must succeed if triggered).
+                should_trace = assessment.weighted_score >= settings.funding.trace_min_score
+                if not should_trace and fresh_signal is not None:
+                    should_trace = float(t.notional_usdc) >= settings.funding.trace_high_water_notional_usdc
+
+                if should_trace:
+                    cached = funding_cache.get(wallet)
+                    funding_signal = cached
+                    if funding_signal is None:
+                        funding_signal = await compute_funding_signal(wallet_address=wallet, as_of=t.ts)
+                        funding_cache[wallet] = funding_signal
+                    bundle = dataclasses.replace(bundle, funding_signal=funding_signal)
+                    assessment = await scorer_trade_time.assess(bundle)
 
                 await feature_repo.upsert(
                     build_trade_features(bundle=bundle, assessment=assessment, computed_at=now_utc())
@@ -385,6 +499,9 @@ async def run_scan(
                 for signal_type, signal in (
                     ("fresh_wallet", fresh_signal),
                     ("size_anomaly", size_signal),
+                    ("sniper_cluster", bundle.sniper_cluster_signal),
+                    ("coentry", bundle.coentry_signal),
+                    ("funding", bundle.funding_signal),
                     ("trade_size_outlier", outlier_signal),
                     ("digit_distribution", digit_signal),
                     ("trade_slicing", slicing_signal),
@@ -401,61 +518,19 @@ async def run_scan(
                         )
                     )
 
-                if assessment.should_alert:
-                    flagged_records.append(
-                        {
-                            "run_id": run_id,
-                            "trade_id": t.trade_id,
-                            "market_id": t.market_id,
-                            "asset_id": t.asset_id,
-                            "wallet_address": t.wallet_address.lower(),
-                            "ts": t.ts.isoformat(),
-                            "side": t.side,
-                            "price": str(t.price),
-                            "size": str(t.size),
-                            "notional_usdc": str(t.notional_usdc),
-                            "risk_score": assessment.weighted_score,
-                            "signals": {
-                                "fresh_wallet": fresh_signal.to_dict() if fresh_signal else None,
-                                "size_anomaly": size_signal.to_dict() if size_signal else None,
-                                "trade_size_outlier": outlier_signal.to_dict() if outlier_signal else None,
-                                "digit_distribution": digit_signal.to_dict() if digit_signal else None,
-                                "trade_slicing": slicing_signal.to_dict() if slicing_signal else None,
-                            },
-                        }
-                    )
+                bundles_by_trade[t.trade_id] = bundle
+                trade_time_assessments[t.trade_id] = assessment
+
+                if idx % commit_every == 0:
+                    await session.commit()
 
             await session.commit()
 
-            flagged_records.sort(key=lambda r: float(r.get("risk_score") or 0.0), reverse=True)
-            with output_path.open("w", encoding="utf-8") as f:
-                for rec in flagged_records:
-                    f.write(json.dumps(rec, default=_json_default) + "\n")
-            written = len(flagged_records)
-
-            # Compute sniper/co-entry and enrich stored signals in Redis for optional second stage.
-            if entries:
-                window_end = datetime.now(UTC)
-                window_start = cutoff
-                clusters, cluster_signals = await asyncio.to_thread(
-                    sniper.detect_clusters, entries, window_start=window_start, window_end=window_end
-                )
-                coentry_signals = await asyncio.to_thread(
-                    sniper.detect_coentry, entries, window_start=window_start, window_end=window_end
-                )
-                # Store in Redis under scan namespace for potential future extensions.
-                ttl = int(timedelta(days=1).total_seconds())
-                for s in cluster_signals:
-                    await redis.set(f"{prefix}sniper:{s.wallet_address}", json.dumps(s.to_dict()), ex=ttl)
-                for s in coentry_signals:
-                    await redis.set(f"{prefix}coentry:{s.wallet_address}", json.dumps(s.to_dict()), ex=ttl)
-
-            # Pre-move evaluation pass (writes as separate signal rows for audit).
-            flagged_ids = {str(r["trade_id"]) for r in flagged_records}
+            # Pre-move evaluation pass (writes as separate signal rows for audit) and
+            # computes "with-future" assessments for ranking only.
             hits = 0
             evaluated = 0
             for t in trades:
-                from polymarket_insider_tracker.detector.pre_move import PreMoveDetectorError
                 from polymarket_insider_tracker.ingestor.models import TradeEvent
 
                 trade_event = TradeEvent(
@@ -474,10 +549,7 @@ async def run_scan(
                     signal = await pre_move.analyze(trade_event, prices=price_repo)
                 except PreMoveDetectorError:
                     continue
-                if t.trade_id in flagged_ids:
-                    evaluated += 1
-                    if float(signal.max_z_score) >= 2.0:
-                        hits += 1
+                pre_move_signals[t.trade_id] = signal
                 await signal_repo.upsert(
                     TradeSignalDTO(
                         trade_id=t.trade_id,
@@ -487,11 +559,91 @@ async def run_scan(
                         computed_at=now_utc(),
                     )
                 )
+
+                base = trade_time_assessments.get(t.trade_id)
+                bundle = bundles_by_trade.get(t.trade_id)
+                if base is None or bundle is None:
+                    continue
+                bundle_future = dataclasses.replace(bundle, pre_move_signal=signal)
+                future = await scorer_with_future.assess(bundle_future)
+                future_assessments[t.trade_id] = future
+
+                # Hit rate is computed for trade-time alerts only (avoid circularity).
+                if base.should_alert:
+                    evaluated += 1
+                    if float(signal.max_z_score) >= float(settings.model.label_z_threshold):
+                        hits += 1
             await session.commit()
 
             hit_rate: Decimal | None = None
             if evaluated > 0:
                 hit_rate = Decimal(str(hits / evaluated))
+
+            flagged_records: list[dict[str, object]] = []
+            for t in trades:
+                base = trade_time_assessments.get(t.trade_id)
+                if base is None:
+                    continue
+                future = future_assessments.get(t.trade_id, base)
+                if not future.should_alert:
+                    continue
+
+                pre = pre_move_signals.get(t.trade_id)
+                bundle = bundles_by_trade[t.trade_id]
+
+                flagged_records.append(
+                    {
+                        "run_id": run_id,
+                        "trade_id": t.trade_id,
+                        "market_id": t.market_id,
+                        "asset_id": t.asset_id,
+                        "wallet_address": t.wallet_address.lower(),
+                        "ts": t.ts.isoformat(),
+                        "side": t.side,
+                        "price": str(t.price),
+                        "size": str(t.size),
+                        "notional_usdc": str(t.notional_usdc),
+                        "risk_score_trade_time": base.weighted_score,
+                        "risk_score_with_future": future.weighted_score,
+                        "would_alert_trade_time": base.should_alert,
+                        "would_alert_with_future": future.should_alert,
+                        "signals": {
+                            "fresh_wallet": bundle.fresh_wallet_signal.to_dict()
+                            if bundle.fresh_wallet_signal
+                            else None,
+                            "size_anomaly": bundle.size_anomaly_signal.to_dict()
+                            if bundle.size_anomaly_signal
+                            else None,
+                            "sniper_cluster": bundle.sniper_cluster_signal.to_dict()
+                            if bundle.sniper_cluster_signal
+                            else None,
+                            "coentry": bundle.coentry_signal.to_dict() if bundle.coentry_signal else None,
+                            "funding": bundle.funding_signal.to_dict() if bundle.funding_signal else None,
+                            "trade_size_outlier": bundle.trade_size_outlier_signal.to_dict()
+                            if bundle.trade_size_outlier_signal
+                            else None,
+                            "digit_distribution": bundle.digit_distribution_signal.to_dict()
+                            if bundle.digit_distribution_signal
+                            else None,
+                            "trade_slicing": bundle.trade_slicing_signal.to_dict()
+                            if bundle.trade_slicing_signal
+                            else None,
+                            "pre_move": pre.to_dict() if pre else None,
+                        },
+                    }
+                )
+
+            flagged_records.sort(
+                key=lambda r: (
+                    float(r.get("risk_score_with_future") or 0.0),
+                    float(r.get("risk_score_trade_time") or 0.0),
+                ),
+                reverse=True,
+            )
+            with output_path.open("w", encoding="utf-8") as f:
+                for rec in flagged_records:
+                    f.write(json.dumps(rec, default=_json_default) + "\n")
+            written = len(flagged_records)
 
             finished_at = datetime.now(UTC)
             run_repo = BacktestRunRepository(session)
@@ -514,6 +666,7 @@ async def run_scan(
                             "lookback_days": settings.scan.lookback_days,
                             "top_k_markets": settings.scan.top_k_markets,
                             "allow_non_historical_book_depth": settings.scan.allow_non_historical_book_depth,
+                            "pre_move_weight": settings.scan.pre_move_weight,
                         }
                     ),
                 )
