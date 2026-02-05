@@ -12,6 +12,7 @@ from polymarket_insider_tracker.ingestor.clob_client import (
     with_retry,
 )
 from polymarket_insider_tracker.ingestor.models import Market, Orderbook
+from py_clob_client.clob_types import ApiCreds
 
 
 class TestRateLimiter:
@@ -124,16 +125,16 @@ class TestClobClient:
         assert client._host == "https://clob.polymarket.com"
         assert client._max_retries == 3
 
-    def test_init_with_env_api_key(self, mock_base_client: MagicMock) -> None:  # noqa: ARG002
-        """Test client reads API key from environment."""
-        with patch.dict("os.environ", {"POLYMARKET_API_KEY": "test-key"}):
-            client = ClobClient()
-            assert client._api_key == "test-key"
+    def test_level2_configured_flag(self, mock_base_client: MagicMock) -> None:  # noqa: ARG002
+        """Level-2 endpoints require both private key and API creds."""
+        client = ClobClient()
+        assert client.is_level2_configured is False
 
-    def test_init_with_explicit_api_key(self, mock_base_client: MagicMock) -> None:  # noqa: ARG002
-        """Test client uses explicitly provided API key."""
-        client = ClobClient(api_key="explicit-key")
-        assert client._api_key == "explicit-key"
+        client2 = ClobClient(
+            private_key="0x" + "1" * 64,
+            api_creds=ApiCreds(key="k", secret="s", passphrase="p"),
+        )
+        assert client2.is_level2_configured is True
 
     def test_health_check_success(self, mock_base_client: MagicMock) -> None:
         """Test health check returns True when API responds OK."""

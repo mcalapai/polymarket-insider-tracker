@@ -182,10 +182,13 @@ class TradeEvent:
         Returns:
             TradeEvent instance.
         """
-        # Parse timestamp - it's a Unix timestamp in seconds
+        # Parse timestamp - activity feeds may use seconds (RTDS) or milliseconds (CLOB).
         raw_timestamp = data.get("timestamp", 0)
-        if isinstance(raw_timestamp, int):
-            timestamp = datetime.fromtimestamp(raw_timestamp, tz=UTC)
+        if isinstance(raw_timestamp, (int, float)):
+            ts_f = float(raw_timestamp)
+            if ts_f > 1e12:
+                ts_f /= 1000.0
+            timestamp = datetime.fromtimestamp(ts_f, tz=UTC)
         else:
             timestamp = datetime.now(UTC)
 
@@ -221,170 +224,105 @@ class TradeEvent:
         """Return True if this is a sell trade."""
         return self.side == "SELL"
 
+
+@dataclass(frozen=True)
+class ClobPriceChange:
+    """A single order-driven book delta from the CLOB market channel."""
+
+    order_hash: str
+    price: Decimal
+    size: Decimal
+    side: Literal["BUY", "SELL"]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ClobPriceChange":
+        side_raw = str(data.get("side", "BUY")).upper()
+        side: Literal["BUY", "SELL"] = "BUY" if side_raw == "BUY" else "SELL"
+        return cls(
+            order_hash=str(data.get("hash", "")),
+            price=Decimal(str(data.get("price", "0"))),
+            size=Decimal(str(data.get("size", "0"))),
+            side=side,
+        )
+
+
+@dataclass(frozen=True)
+class ClobPriceChangeEvent:
+    """A price_change event from the CLOB market channel."""
+
+    asset_id: str
+    market: str
+    timestamp: datetime
+    price_changes: tuple[ClobPriceChange, ...]
+    best_bid: Decimal | None
+    best_ask: Decimal | None
+
+    @classmethod
+    def from_websocket_message(cls, data: dict[str, Any]) -> "ClobPriceChangeEvent":
+        raw_ts = data.get("timestamp")
+        if isinstance(raw_ts, (int, float)):
+            timestamp = datetime.fromtimestamp(float(raw_ts) / 1000.0, tz=UTC)
+        else:
+            timestamp = datetime.now(UTC)
+
+        changes = tuple(
+            ClobPriceChange.from_dict(x) for x in (data.get("price_changes") or []) if isinstance(x, dict)
+        )
+        best_bid = data.get("best_bid")
+        best_ask = data.get("best_ask")
+        return cls(
+            asset_id=str(data.get("asset_id", "")),
+            market=str(data.get("market", "")),
+            timestamp=timestamp,
+            price_changes=changes,
+            best_bid=Decimal(str(best_bid)) if best_bid is not None else None,
+            best_ask=Decimal(str(best_ask)) if best_ask is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class ClobBookEvent:
+    """A book snapshot event from the CLOB market channel."""
+
+    asset_id: str
+    market: str
+    timestamp: datetime
+    bids: tuple[OrderbookLevel, ...]
+    asks: tuple[OrderbookLevel, ...]
+
+    @classmethod
+    def from_websocket_message(cls, data: dict[str, Any]) -> "ClobBookEvent":
+        raw_ts = data.get("timestamp")
+        if isinstance(raw_ts, (int, float)):
+            timestamp = datetime.fromtimestamp(float(raw_ts) / 1000.0, tz=UTC)
+        else:
+            timestamp = datetime.now(UTC)
+        bids = tuple(
+            OrderbookLevel.from_dict(x) for x in (data.get("bids") or []) if isinstance(x, dict)
+        )
+        asks = tuple(
+            OrderbookLevel.from_dict(x) for x in (data.get("asks") or []) if isinstance(x, dict)
+        )
+        return cls(
+            asset_id=str(data.get("asset_id", "")),
+            market=str(data.get("market", "")),
+            timestamp=timestamp,
+            bids=bids,
+            asks=asks,
+        )
+
     @property
     def notional_value(self) -> Decimal:
         """Return the notional value of the trade (price * size)."""
         return self.price * self.size
 
 
-# Category keywords for market classification
-_CATEGORY_KEYWORDS: dict[str, list[str]] = {
-    "politics": [
-        "election",
-        "president",
-        "congress",
-        "senate",
-        "house",
-        "governor",
-        "mayor",
-        "vote",
-        "ballot",
-        "democrat",
-        "republican",
-        "trump",
-        "biden",
-        "political",
-        "party",
-        "campaign",
-        "poll",
-        "primary",
-        "caucus",
-    ],
-    "crypto": [
-        "bitcoin",
-        "ethereum",
-        "crypto",
-        "btc",
-        "eth",
-        "blockchain",
-        "token",
-        "defi",
-        "nft",
-        "altcoin",
-        "solana",
-        "cardano",
-        "dogecoin",
-    ],
-    "sports": [
-        "nfl",
-        "nba",
-        "mlb",
-        "nhl",
-        "soccer",
-        "football",
-        "basketball",
-        "baseball",
-        "hockey",
-        "tennis",
-        "golf",
-        "ufc",
-        "boxing",
-        "olympics",
-        "championship",
-        "super bowl",
-        "world cup",
-        "playoffs",
-        "finals",
-    ],
-    "entertainment": [
-        "movie",
-        "film",
-        "oscar",
-        "grammy",
-        "emmy",
-        "album",
-        "song",
-        "celebrity",
-        "netflix",
-        "disney",
-        "streaming",
-        "box office",
-        "tv show",
-        "series",
-        "actor",
-        "actress",
-        "music",
-    ],
-    "finance": [
-        "stock",
-        "market",
-        "fed",
-        "interest rate",
-        "inflation",
-        "gdp",
-        "unemployment",
-        "recession",
-        "economy",
-        "s&p",
-        "nasdaq",
-        "dow",
-        "treasury",
-        "bond",
-        "forex",
-        "gold",
-        "oil",
-        "commodity",
-    ],
-    "tech": [
-        "apple",
-        "google",
-        "microsoft",
-        "amazon",
-        "meta",
-        "tesla",
-        "ai",
-        "artificial intelligence",
-        "chatgpt",
-        "openai",
-        "semiconductor",
-        "iphone",
-        "android",
-        "software",
-        "hardware",
-        "startup",
-    ],
-    "science": [
-        "nasa",
-        "space",
-        "climate",
-        "weather",
-        "vaccine",
-        "covid",
-        "fda",
-        "drug",
-        "trial",
-        "research",
-        "study",
-        "discovery",
-    ],
-}
-
-
-def derive_category(title: str) -> str:
-    """Derive a market category from the market title.
-
-    Args:
-        title: The market question or title.
-
-    Returns:
-        Category string, or "other" if no match found.
-    """
-    title_lower = title.lower()
-
-    for category, keywords in _CATEGORY_KEYWORDS.items():
-        for keyword in keywords:
-            if keyword in title_lower:
-                return category
-
-    return "other"
-
-
 @dataclass(frozen=True)
 class MarketMetadata:
     """Extended market metadata with derived fields and caching support.
 
-    This combines the core Market data with derived metadata like category
-    and is designed for efficient caching in Redis.
+    This combines core Market data with cached liquidity fields and is designed
+    for efficient caching in Redis.
     """
 
     # Core market data
@@ -396,8 +334,11 @@ class MarketMetadata:
     active: bool = True
     closed: bool = False
 
-    # Derived metadata
-    category: str = "other"
+    # Liquidity metrics (optional; updated by liquidity service)
+    rolling_24h_volume_usdc: Decimal | None = None
+    visible_book_depth_usdc: Decimal | None = None
+    mid_price: Decimal | None = None
+    last_liquidity_update_at: datetime | None = None
 
     # Cache metadata
     last_updated: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -420,7 +361,6 @@ class MarketMetadata:
             end_date=market.end_date,
             active=market.active,
             closed=market.closed,
-            category=derive_category(market.question),
             last_updated=datetime.now(UTC),
         )
 
@@ -445,7 +385,16 @@ class MarketMetadata:
             "end_date": self.end_date.isoformat() if self.end_date else None,
             "active": self.active,
             "closed": self.closed,
-            "category": self.category,
+            "rolling_24h_volume_usdc": str(self.rolling_24h_volume_usdc)
+            if self.rolling_24h_volume_usdc is not None
+            else None,
+            "visible_book_depth_usdc": str(self.visible_book_depth_usdc)
+            if self.visible_book_depth_usdc is not None
+            else None,
+            "mid_price": str(self.mid_price) if self.mid_price is not None else None,
+            "last_liquidity_update_at": self.last_liquidity_update_at.isoformat()
+            if self.last_liquidity_update_at is not None
+            else None,
             "last_updated": self.last_updated.isoformat(),
         }
 
@@ -485,6 +434,15 @@ class MarketMetadata:
             end_date=end_date,
             active=bool(data.get("active", True)),
             closed=bool(data.get("closed", False)),
-            category=str(data.get("category", "other")),
+            rolling_24h_volume_usdc=Decimal(str(v))
+            if (v := data.get("rolling_24h_volume_usdc")) is not None
+            else None,
+            visible_book_depth_usdc=Decimal(str(v))
+            if (v := data.get("visible_book_depth_usdc")) is not None
+            else None,
+            mid_price=Decimal(str(v)) if (v := data.get("mid_price")) is not None else None,
+            last_liquidity_update_at=datetime.fromisoformat(v)
+            if (v := data.get("last_liquidity_update_at")) is not None
+            else None,
             last_updated=last_updated,
         )

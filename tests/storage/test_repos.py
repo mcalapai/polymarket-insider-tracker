@@ -8,12 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from polymarket_insider_tracker.storage.models import Base
 from polymarket_insider_tracker.storage.repos import (
-    FundingRepository,
-    FundingTransferDTO,
+    ERC20TransferDTO,
+    ERC20TransferRepository,
     RelationshipRepository,
-    WalletProfileDTO,
     WalletRelationshipDTO,
-    WalletRepository,
+    WalletSnapshotDTO,
+    WalletSnapshotRepository,
 )
 
 # ============================================================================
@@ -43,28 +43,32 @@ async def async_session(async_engine) -> AsyncSession:
 
 
 @pytest.fixture
-def sample_wallet_dto() -> WalletProfileDTO:
-    """Create a sample wallet profile DTO."""
-    return WalletProfileDTO(
+def sample_wallet_dto() -> WalletSnapshotDTO:
+    """Create a sample wallet snapshot DTO."""
+    as_of = datetime.now(UTC)
+    return WalletSnapshotDTO(
         address="0x1234567890abcdef1234567890abcdef12345678",
-        nonce=5,
-        first_seen_at=datetime.now(UTC) - timedelta(hours=24),
-        is_fresh=True,
-        matic_balance=Decimal("1000000000000000000"),
-        usdc_balance=Decimal("1000.00"),
-        analyzed_at=datetime.now(UTC),
+        as_of_block_number=123,
+        as_of=as_of,
+        nonce_as_of=5,
+        first_funding_at=as_of - timedelta(hours=24),
+        age_hours_as_of=Decimal("24.0"),
+        matic_balance_wei_as_of=Decimal("1000000000000000000"),
+        usdc_balance_units_as_of=Decimal("1000000000"),
+        computed_at=as_of,
     )
 
 
 @pytest.fixture
-def sample_transfer_dto() -> FundingTransferDTO:
-    """Create a sample funding transfer DTO."""
-    return FundingTransferDTO(
+def sample_transfer_dto() -> ERC20TransferDTO:
+    """Create a sample ERC20 transfer DTO."""
+    return ERC20TransferDTO(
+        token_address="0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
         from_address="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         to_address="0x1234567890abcdef1234567890abcdef12345678",
-        amount=Decimal("5000.00"),
-        token="USDC",
+        amount_units=Decimal("5000000"),
         tx_hash="0x" + "a" * 64,
+        log_index=0,
         block_number=12345678,
         timestamp=datetime.now(UTC),
     )
@@ -82,180 +86,130 @@ def sample_relationship_dto() -> WalletRelationshipDTO:
 
 
 # ============================================================================
-# WalletRepository Tests
+# WalletSnapshotRepository Tests
 # ============================================================================
 
 
-class TestWalletRepository:
-    """Tests for WalletRepository."""
+class TestWalletSnapshotRepository:
+    """Tests for WalletSnapshotRepository."""
 
     @pytest.mark.asyncio
-    async def test_get_by_address_not_found(self, async_session: AsyncSession) -> None:
-        """Test getting a non-existent wallet returns None."""
-        repo = WalletRepository(async_session)
-        result = await repo.get_by_address("0xnonexistent")
+    async def test_get_by_address_and_block_not_found(self, async_session: AsyncSession) -> None:
+        repo = WalletSnapshotRepository(async_session)
+        result = await repo.get_by_address_and_block("0xnonexistent", as_of_block_number=1)
         assert result is None
 
     @pytest.mark.asyncio
     async def test_upsert_creates_new(
-        self, async_session: AsyncSession, sample_wallet_dto: WalletProfileDTO
+        self, async_session: AsyncSession, sample_wallet_dto: WalletSnapshotDTO
     ) -> None:
-        """Test upserting a new wallet profile."""
-        repo = WalletRepository(async_session)
+        repo = WalletSnapshotRepository(async_session)
         await repo.upsert(sample_wallet_dto)
         await async_session.commit()
 
-        result = await repo.get_by_address(sample_wallet_dto.address)
+        result = await repo.get_by_address_and_block(
+            sample_wallet_dto.address,
+            as_of_block_number=sample_wallet_dto.as_of_block_number,
+        )
         assert result is not None
         assert result.address == sample_wallet_dto.address.lower()
-        assert result.nonce == sample_wallet_dto.nonce
-        assert result.is_fresh == sample_wallet_dto.is_fresh
+        assert result.nonce_as_of == sample_wallet_dto.nonce_as_of
 
     @pytest.mark.asyncio
     async def test_upsert_updates_existing(
-        self, async_session: AsyncSession, sample_wallet_dto: WalletProfileDTO
+        self, async_session: AsyncSession, sample_wallet_dto: WalletSnapshotDTO
     ) -> None:
-        """Test upserting updates existing profile."""
-        repo = WalletRepository(async_session)
+        repo = WalletSnapshotRepository(async_session)
         await repo.upsert(sample_wallet_dto)
         await async_session.commit()
 
-        # Update the DTO
-        updated_dto = WalletProfileDTO(
+        updated_dto = WalletSnapshotDTO(
             address=sample_wallet_dto.address,
-            nonce=10,
-            first_seen_at=sample_wallet_dto.first_seen_at,
-            is_fresh=False,
-            matic_balance=sample_wallet_dto.matic_balance,
-            usdc_balance=Decimal("2000.00"),
-            analyzed_at=datetime.now(UTC),
+            as_of_block_number=sample_wallet_dto.as_of_block_number,
+            as_of=sample_wallet_dto.as_of,
+            nonce_as_of=10,
+            first_funding_at=sample_wallet_dto.first_funding_at,
+            age_hours_as_of=sample_wallet_dto.age_hours_as_of,
+            matic_balance_wei_as_of=sample_wallet_dto.matic_balance_wei_as_of,
+            usdc_balance_units_as_of=Decimal("2000000000"),
+            computed_at=datetime.now(UTC),
         )
         await repo.upsert(updated_dto)
         await async_session.commit()
 
-        result = await repo.get_by_address(sample_wallet_dto.address)
-        assert result is not None
-        assert result.nonce == 10
-        assert result.is_fresh is False
-        assert result.usdc_balance == Decimal("2000.00")
-
-    @pytest.mark.asyncio
-    async def test_get_many(
-        self, async_session: AsyncSession, sample_wallet_dto: WalletProfileDTO
-    ) -> None:
-        """Test getting multiple wallets."""
-        repo = WalletRepository(async_session)
-
-        # Insert two wallets
-        dto2 = WalletProfileDTO(
-            address="0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            nonce=3,
-            first_seen_at=datetime.now(UTC),
-            is_fresh=True,
-            matic_balance=None,
-            usdc_balance=None,
-            analyzed_at=datetime.now(UTC),
+        result = await repo.get_by_address_and_block(
+            sample_wallet_dto.address,
+            as_of_block_number=sample_wallet_dto.as_of_block_number,
         )
-        await repo.upsert(sample_wallet_dto)
-        await repo.upsert(dto2)
-        await async_session.commit()
-
-        results = await repo.get_many([sample_wallet_dto.address, dto2.address])
-        assert len(results) == 2
-
-    @pytest.mark.asyncio
-    async def test_get_fresh_wallets(
-        self, async_session: AsyncSession, sample_wallet_dto: WalletProfileDTO
-    ) -> None:
-        """Test getting fresh wallets."""
-        repo = WalletRepository(async_session)
-
-        # Insert fresh and non-fresh wallets
-        non_fresh = WalletProfileDTO(
-            address="0xcccccccccccccccccccccccccccccccccccccccc",
-            nonce=100,
-            first_seen_at=datetime.now(UTC) - timedelta(days=30),
-            is_fresh=False,
-            matic_balance=None,
-            usdc_balance=None,
-            analyzed_at=datetime.now(UTC),
-        )
-        await repo.upsert(sample_wallet_dto)
-        await repo.upsert(non_fresh)
-        await async_session.commit()
-
-        results = await repo.get_fresh_wallets()
-        assert len(results) == 1
-        assert results[0].is_fresh is True
-
-    @pytest.mark.asyncio
-    async def test_delete(
-        self, async_session: AsyncSession, sample_wallet_dto: WalletProfileDTO
-    ) -> None:
-        """Test deleting a wallet profile."""
-        repo = WalletRepository(async_session)
-        await repo.upsert(sample_wallet_dto)
-        await async_session.commit()
-
-        deleted = await repo.delete(sample_wallet_dto.address)
-        await async_session.commit()
-        assert deleted is True
-
-        result = await repo.get_by_address(sample_wallet_dto.address)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_delete_not_found(self, async_session: AsyncSession) -> None:
-        """Test deleting non-existent wallet returns False."""
-        repo = WalletRepository(async_session)
-        deleted = await repo.delete("0xnonexistent")
-        assert deleted is False
-
-    @pytest.mark.asyncio
-    async def test_mark_stale(
-        self, async_session: AsyncSession, sample_wallet_dto: WalletProfileDTO
-    ) -> None:
-        """Test marking a wallet as stale."""
-        repo = WalletRepository(async_session)
-        await repo.upsert(sample_wallet_dto)
-        await async_session.commit()
-
-        marked = await repo.mark_stale(sample_wallet_dto.address)
-        await async_session.commit()
-        assert marked is True
-
-        result = await repo.get_by_address(sample_wallet_dto.address)
         assert result is not None
-        assert result.analyzed_at.year == 2000
+        assert result.nonce_as_of == 10
+        assert result.usdc_balance_units_as_of == Decimal("2000000000")
+
+    @pytest.mark.asyncio
+    async def test_get_latest_by_address(self, async_session: AsyncSession) -> None:
+        repo = WalletSnapshotRepository(async_session)
+        addr = "0xdddddddddddddddddddddddddddddddddddddddd"
+        base_ts = datetime.now(UTC)
+        await repo.upsert(
+            WalletSnapshotDTO(
+                address=addr,
+                as_of_block_number=1,
+                as_of=base_ts,
+                nonce_as_of=1,
+                first_funding_at=base_ts - timedelta(hours=1),
+                age_hours_as_of=Decimal("1.0"),
+                matic_balance_wei_as_of=Decimal("1"),
+                usdc_balance_units_as_of=Decimal("2"),
+                computed_at=base_ts,
+            )
+        )
+        await repo.upsert(
+            WalletSnapshotDTO(
+                address=addr,
+                as_of_block_number=2,
+                as_of=base_ts + timedelta(minutes=1),
+                nonce_as_of=2,
+                first_funding_at=base_ts - timedelta(hours=1),
+                age_hours_as_of=Decimal("1.016666"),
+                matic_balance_wei_as_of=Decimal("1"),
+                usdc_balance_units_as_of=Decimal("2"),
+                computed_at=base_ts,
+            )
+        )
+        await async_session.commit()
+
+        latest = await repo.get_latest_by_address(addr)
+        assert latest is not None
+        assert latest.as_of_block_number == 2
 
 
 # ============================================================================
-# FundingRepository Tests
+# ERC20TransferRepository Tests
 # ============================================================================
 
 
-class TestFundingRepository:
-    """Tests for FundingRepository."""
+class TestERC20TransferRepository:
+    """Tests for ERC20TransferRepository."""
 
     @pytest.mark.asyncio
     async def test_insert(
-        self, async_session: AsyncSession, sample_transfer_dto: FundingTransferDTO
+        self, async_session: AsyncSession, sample_transfer_dto: ERC20TransferDTO
     ) -> None:
-        """Test inserting a funding transfer."""
-        repo = FundingRepository(async_session)
+        """Test inserting an ERC20 transfer."""
+        repo = ERC20TransferRepository(async_session)
         await repo.insert(sample_transfer_dto)
         await async_session.commit()
 
         result = await repo.get_by_tx_hash(sample_transfer_dto.tx_hash)
         assert result is not None
-        assert result.amount == sample_transfer_dto.amount
+        assert result.amount_units == sample_transfer_dto.amount_units
 
     @pytest.mark.asyncio
     async def test_get_transfers_to(
-        self, async_session: AsyncSession, sample_transfer_dto: FundingTransferDTO
+        self, async_session: AsyncSession, sample_transfer_dto: ERC20TransferDTO
     ) -> None:
         """Test getting transfers to an address."""
-        repo = FundingRepository(async_session)
+        repo = ERC20TransferRepository(async_session)
         await repo.insert(sample_transfer_dto)
         await async_session.commit()
 
@@ -265,10 +219,10 @@ class TestFundingRepository:
 
     @pytest.mark.asyncio
     async def test_get_transfers_from(
-        self, async_session: AsyncSession, sample_transfer_dto: FundingTransferDTO
+        self, async_session: AsyncSession, sample_transfer_dto: ERC20TransferDTO
     ) -> None:
         """Test getting transfers from an address."""
-        repo = FundingRepository(async_session)
+        repo = ERC20TransferRepository(async_session)
         await repo.insert(sample_transfer_dto)
         await async_session.commit()
 
@@ -278,18 +232,19 @@ class TestFundingRepository:
 
     @pytest.mark.asyncio
     async def test_get_first_transfer_to(
-        self, async_session: AsyncSession, sample_transfer_dto: FundingTransferDTO
+        self, async_session: AsyncSession, sample_transfer_dto: ERC20TransferDTO
     ) -> None:
         """Test getting first transfer to an address."""
-        repo = FundingRepository(async_session)
+        repo = ERC20TransferRepository(async_session)
 
         # Insert multiple transfers with different timestamps
-        earlier = FundingTransferDTO(
+        earlier = ERC20TransferDTO(
+            token_address=sample_transfer_dto.token_address,
             from_address="0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             to_address=sample_transfer_dto.to_address,
-            amount=Decimal("100.00"),
-            token="USDC",
+            amount_units=Decimal("100000"),
             tx_hash="0x" + "b" * 64,
+            log_index=0,
             block_number=12345670,
             timestamp=datetime.now(UTC) - timedelta(hours=2),
         )
@@ -297,22 +252,26 @@ class TestFundingRepository:
         await repo.insert(sample_transfer_dto)
         await async_session.commit()
 
-        result = await repo.get_first_transfer_to(sample_transfer_dto.to_address)
+        result = await repo.get_first_transfer_to(
+            sample_transfer_dto.to_address,
+            token_addresses=[sample_transfer_dto.token_address],
+        )
         assert result is not None
         assert result.tx_hash == earlier.tx_hash.lower()
 
     @pytest.mark.asyncio
     async def test_insert_many(self, async_session: AsyncSession) -> None:
         """Test inserting multiple transfers."""
-        repo = FundingRepository(async_session)
+        repo = ERC20TransferRepository(async_session)
 
         transfers = [
-            FundingTransferDTO(
+            ERC20TransferDTO(
+                token_address="0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
                 from_address=f"0x{'a' * 40}",
                 to_address=f"0x{'b' * 40}",
-                amount=Decimal(f"{i * 100}.00"),
-                token="USDC",
+                amount_units=Decimal(str(i * 100_000)),
                 tx_hash=f"0x{str(i) * 64}"[:66],
+                log_index=0,
                 block_number=12345678 + i,
                 timestamp=datetime.now(UTC),
             )
@@ -432,49 +391,50 @@ class TestRelationshipRepository:
 class TestDTOs:
     """Tests for Data Transfer Objects."""
 
-    def test_wallet_profile_dto_from_model(self) -> None:
-        """Test WalletProfileDTO.from_model works correctly."""
-        from polymarket_insider_tracker.storage.models import WalletProfileModel
+    def test_wallet_snapshot_dto_from_model(self) -> None:
+        """Test WalletSnapshotDTO.from_model works correctly."""
+        from polymarket_insider_tracker.storage.models import WalletSnapshotModel
 
         now = datetime.now(UTC)
-        model = WalletProfileModel(
-            id=1,
+        model = WalletSnapshotModel(
             address="0x1234",
-            nonce=5,
-            first_seen_at=now,
-            is_fresh=True,
-            matic_balance=Decimal("100"),
-            usdc_balance=Decimal("50.00"),
-            analyzed_at=now,
+            as_of_block_number=123,
+            as_of=now,
+            nonce_as_of=5,
+            first_funding_at=now - timedelta(hours=1),
+            age_hours_as_of=Decimal("1.0"),
+            matic_balance_wei_as_of=Decimal("100"),
+            usdc_balance_units_as_of=Decimal("50000000"),
+            computed_at=now,
             created_at=now,
-            updated_at=now,
         )
 
-        dto = WalletProfileDTO.from_model(model)
+        dto = WalletSnapshotDTO.from_model(model)
         assert dto.address == "0x1234"
-        assert dto.nonce == 5
-        assert dto.is_fresh is True
+        assert dto.as_of_block_number == 123
+        assert dto.nonce_as_of == 5
 
-    def test_funding_transfer_dto_from_model(self) -> None:
-        """Test FundingTransferDTO.from_model works correctly."""
-        from polymarket_insider_tracker.storage.models import FundingTransferModel
+    def test_erc20_transfer_dto_from_model(self) -> None:
+        """Test ERC20TransferDTO.from_model works correctly."""
+        from polymarket_insider_tracker.storage.models import ERC20TransferModel
 
         now = datetime.now(UTC)
-        model = FundingTransferModel(
+        model = ERC20TransferModel(
             id=1,
+            token_address="0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
             from_address="0xaaa",
             to_address="0xbbb",
-            amount=Decimal("100.00"),
-            token="USDC",
+            amount_units=Decimal("100000"),
             tx_hash="0x123",
+            log_index=0,
             block_number=12345,
             timestamp=now,
             created_at=now,
         )
 
-        dto = FundingTransferDTO.from_model(model)
+        dto = ERC20TransferDTO.from_model(model)
         assert dto.from_address == "0xaaa"
-        assert dto.amount == Decimal("100.00")
+        assert dto.amount_units == Decimal("100000")
 
     def test_wallet_relationship_dto_from_model(self) -> None:
         """Test WalletRelationshipDTO.from_model works correctly."""

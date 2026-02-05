@@ -137,6 +137,21 @@ class WalletProfile:
 
 
 @dataclass(frozen=True)
+class WalletSnapshot:
+    """Time-aware wallet snapshot used for trade-time analysis."""
+
+    address: str
+    as_of: datetime
+    as_of_block_number: int
+    nonce_as_of: int
+    matic_balance_wei_as_of: Decimal
+    usdc_balance_units_as_of: Decimal
+    first_funding_at: datetime
+    age_hours_as_of: float
+    computed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True)
 class FundingTransfer:
     """Represents an ERC20 token transfer for funding chain analysis.
 

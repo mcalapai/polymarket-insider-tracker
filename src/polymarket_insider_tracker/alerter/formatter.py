@@ -63,8 +63,28 @@ def get_triggered_signals(assessment: RiskAssessment) -> list[str]:
         signals.append("Fresh Wallet")
     if assessment.size_anomaly_signal:
         signals.append("Large Position")
-        if assessment.size_anomaly_signal.is_niche_market:
-            signals.append("Niche Market")
+    if assessment.sniper_cluster_signal:
+        signals.append("Sniper Cluster")
+    if assessment.coentry_signal:
+        signals.append("Co-entry Correlation")
+    if getattr(assessment, "funding_signal", None):
+        signals.append("Funding Origin")
+    if getattr(assessment, "pre_move_signal", None):
+        signals.append("Pre-move")
+    if getattr(assessment, "trade_size_outlier_signal", None):
+        signals.append("Trade Size Outlier")
+    if getattr(assessment, "digit_distribution_signal", None):
+        signals.append("Digit Distribution")
+    if getattr(assessment, "trade_slicing_signal", None):
+        signals.append("Trade Slicing")
+    if getattr(assessment, "order_to_trade_ratio_signal", None):
+        signals.append("Order/Trade Ratio")
+    if getattr(assessment, "rapid_cancel_signal", None):
+        signals.append("Rapid Cancel")
+    if getattr(assessment, "book_impact_without_fill_signal", None):
+        signals.append("Book Impact (No Fill)")
+    if getattr(assessment, "model_score_signal", None):
+        signals.append("Model Score")
     return signals
 
 
@@ -189,12 +209,11 @@ class AlertFormatter:
         # Get wallet age if available
         wallet_age_str = ""
         if assessment.fresh_wallet_signal:
-            age_hours = assessment.fresh_wallet_signal.wallet_profile.age_hours
-            if age_hours is not None:
-                if age_hours < 1:
-                    wallet_age_str = f" (Age: {int(age_hours * 60)}m)"
-                else:
-                    wallet_age_str = f" (Age: {age_hours:.0f}h)"
+            age_hours = assessment.fresh_wallet_signal.wallet_snapshot.age_hours_as_of
+            if age_hours < 1:
+                wallet_age_str = f" (Age: {int(age_hours * 60)}m)"
+            else:
+                wallet_age_str = f" (Age: {age_hours:.0f}h)"
 
         fields: list[dict[str, object]] = [
             {
@@ -223,6 +242,37 @@ class AlertFormatter:
         )
         fields.append({"name": "Trade", "value": trade_detail, "inline": False})
 
+        if getattr(assessment, "order_to_trade_ratio_signal", None) or getattr(
+            assessment, "rapid_cancel_signal", None
+        ) or getattr(assessment, "book_impact_without_fill_signal", None):
+            lines: list[str] = []
+            if getattr(assessment, "order_to_trade_ratio_signal", None):
+                s = assessment.order_to_trade_ratio_signal
+                lines.append(
+                    f"Order/Trade Ratio ({s.window_minutes}m): {s.orders_placed}/{s.trades_executed} = {s.ratio:.2f} (p={s.ratio_percentile:.3f})"
+                )
+            if getattr(assessment, "rapid_cancel_signal", None):
+                s = assessment.rapid_cancel_signal
+                lines.append(
+                    f"Rapid Cancel: {s.cancel_latency_seconds:.1f}s (p={s.latency_percentile:.3f}, fill={s.fill_ratio:.3f})"
+                )
+            if getattr(assessment, "book_impact_without_fill_signal", None):
+                s = assessment.book_impact_without_fill_signal
+                lines.append(
+                    f"Book Impact: {s.impact_bps:.1f} bps (p={s.impact_percentile:.3f}, {s.cancel_latency_seconds:.1f}s, fill={s.fill_ratio:.3f})"
+                )
+            fields.append({"name": "Orders", "value": "\n".join(lines), "inline": False})
+
+        if getattr(assessment, "funding_signal", None):
+            f = assessment.funding_signal
+            fields.append(
+                {
+                    "name": "Funding",
+                    "value": f"{f.origin_type} | hops={f.hop_count} | susp={f.suspiciousness:.2f}",
+                    "inline": False,
+                }
+            )
+
         # Signals (if any)
         if signals:
             fields.append(
@@ -243,6 +293,27 @@ class AlertFormatter:
             if assessment.size_anomaly_signal:
                 conf = assessment.size_anomaly_signal.confidence
                 confidences.append(f"Size Anomaly: {conf:.0%}")
+            if assessment.sniper_cluster_signal:
+                conf = assessment.sniper_cluster_signal.confidence
+                confidences.append(f"Sniper Cluster: {conf:.0%}")
+            if assessment.coentry_signal:
+                conf = assessment.coentry_signal.confidence
+                confidences.append(f"Co-entry: {conf:.0%}")
+            if getattr(assessment, "funding_signal", None):
+                conf = assessment.funding_signal.confidence
+                confidences.append(f"Funding: {conf:.0%}")
+            if getattr(assessment, "pre_move_signal", None):
+                conf = assessment.pre_move_signal.confidence
+                confidences.append(f"Pre-move: {conf:.0%}")
+            if getattr(assessment, "trade_size_outlier_signal", None):
+                conf = assessment.trade_size_outlier_signal.confidence
+                confidences.append(f"Trade Outlier: {conf:.0%}")
+            if getattr(assessment, "digit_distribution_signal", None):
+                conf = assessment.digit_distribution_signal.confidence
+                confidences.append(f"Digits: {conf:.0%}")
+            if getattr(assessment, "trade_slicing_signal", None):
+                conf = assessment.trade_slicing_signal.confidence
+                confidences.append(f"Slicing: {conf:.0%}")
 
             if confidences:
                 fields.append(
@@ -282,12 +353,11 @@ class AlertFormatter:
         # Wallet with link
         wallet_line = f"*Wallet:* `{wallet_short}`"
         if assessment.fresh_wallet_signal:
-            age_hours = assessment.fresh_wallet_signal.wallet_profile.age_hours
-            if age_hours is not None:
-                if age_hours < 1:
-                    wallet_line += f" \\(Age: {int(age_hours * 60)}m\\)"
-                else:
-                    wallet_line += f" \\(Age: {age_hours:.0f}h\\)"
+            age_hours = assessment.fresh_wallet_signal.wallet_snapshot.age_hours_as_of
+            if age_hours < 1:
+                wallet_line += f" \\(Age: {int(age_hours * 60)}m\\)"
+            else:
+                wallet_line += f" \\(Age: {age_hours:.0f}h\\)"
         lines.append(wallet_line)
 
         # Risk score
@@ -311,6 +381,22 @@ class AlertFormatter:
         # Signals
         if signals:
             lines.append(f"*Signals:* {', '.join(signals)}")
+
+        if getattr(assessment, "order_to_trade_ratio_signal", None):
+            s = assessment.order_to_trade_ratio_signal
+            lines.append(
+                f"*Order/Trade Ratio:* {s.orders_placed}/{s.trades_executed}={s.ratio:.2f} \\(p={s.ratio_percentile:.3f}\\)"
+            )
+        if getattr(assessment, "rapid_cancel_signal", None):
+            s = assessment.rapid_cancel_signal
+            lines.append(
+                f"*Rapid Cancel:* {s.cancel_latency_seconds:.1f}s \\(p={s.latency_percentile:.3f}, fill={s.fill_ratio:.3f}\\)"
+            )
+        if getattr(assessment, "book_impact_without_fill_signal", None):
+            s = assessment.book_impact_without_fill_signal
+            lines.append(
+                f"*Book Impact:* {s.impact_bps:.1f} bps \\(p={s.impact_percentile:.3f}, {s.cancel_latency_seconds:.1f}s, fill={s.fill_ratio:.3f}\\)"
+            )
 
         # Links
         lines.append("")
@@ -367,12 +453,11 @@ class AlertFormatter:
         # Wallet info
         wallet_line = f"Wallet: {wallet_short}"
         if assessment.fresh_wallet_signal:
-            age_hours = assessment.fresh_wallet_signal.wallet_profile.age_hours
-            if age_hours is not None:
-                if age_hours < 1:
-                    wallet_line += f" (Age: {int(age_hours * 60)}m)"
-                else:
-                    wallet_line += f" (Age: {age_hours:.0f}h)"
+            age_hours = assessment.fresh_wallet_signal.wallet_snapshot.age_hours_as_of
+            if age_hours < 1:
+                wallet_line += f" (Age: {int(age_hours * 60)}m)"
+            else:
+                wallet_line += f" (Age: {age_hours:.0f}h)"
         lines.append(wallet_line)
 
         # Risk
@@ -391,6 +476,22 @@ class AlertFormatter:
         # Signals
         if signals:
             lines.append(f"Signals: {', '.join(signals)}")
+
+        if getattr(assessment, "order_to_trade_ratio_signal", None):
+            s = assessment.order_to_trade_ratio_signal
+            lines.append(
+                f"Order/Trade Ratio ({s.window_minutes}m): {s.orders_placed}/{s.trades_executed}={s.ratio:.2f} (p={s.ratio_percentile:.3f})"
+            )
+        if getattr(assessment, "rapid_cancel_signal", None):
+            s = assessment.rapid_cancel_signal
+            lines.append(
+                f"Rapid Cancel: {s.cancel_latency_seconds:.1f}s (p={s.latency_percentile:.3f}, fill={s.fill_ratio:.3f})"
+            )
+        if getattr(assessment, "book_impact_without_fill_signal", None):
+            s = assessment.book_impact_without_fill_signal
+            lines.append(
+                f"Book Impact: {s.impact_bps:.1f} bps (p={s.impact_percentile:.3f}, {s.cancel_latency_seconds:.1f}s, fill={s.fill_ratio:.3f})"
+            )
 
         # Links
         lines.append("")

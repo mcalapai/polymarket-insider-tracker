@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,7 +14,7 @@ from polymarket_insider_tracker.detector.models import FreshWalletSignal
 from polymarket_insider_tracker.detector.scorer import SignalBundle
 from polymarket_insider_tracker.ingestor.models import TradeEvent
 from polymarket_insider_tracker.pipeline import Pipeline, PipelineState
-from polymarket_insider_tracker.profiler.models import WalletProfile
+from polymarket_insider_tracker.profiler.models import WalletSnapshot
 
 
 @pytest.fixture
@@ -32,8 +32,24 @@ def mock_settings():
     polygon.fallback_rpc_url = None
 
     polymarket = MagicMock()
-    polymarket.ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    polymarket.api_key = None
+    polymarket.trade_ws_url = "wss://ws-live-data.polymarket.com"
+    polymarket.clob_market_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    polymarket.clob_host = "https://clob.polymarket.com"
+    polymarket.clob_chain_id = 137
+    polymarket.clob_private_key = None
+    polymarket.clob_api_key = None
+    polymarket.clob_api_secret = None
+    polymarket.clob_api_passphrase = None
+    polymarket.clob_signature_type = None
+    polymarket.clob_funder = None
+
+    orders = MagicMock()
+    orders.enabled = False
+
+    funding = MagicMock()
+    funding.trace_min_score = 1.0
+    funding.trace_high_water_notional_usdc = 1e12
+    funding.lookback_days = 180
 
     discord = MagicMock()
     discord.enabled = False
@@ -49,6 +65,8 @@ def mock_settings():
     settings.database = database
     settings.polygon = polygon
     settings.polymarket = polymarket
+    settings.orders = orders
+    settings.funding = funding
     settings.discord = discord
     settings.telegram = telegram
     settings.dry_run = True
@@ -59,9 +77,9 @@ def mock_settings():
 def sample_trade_event():
     """Create a sample trade event for testing."""
     return TradeEvent(
+        market_id="0x" + "c" * 64,
         trade_id="0x" + "a" * 64,
         wallet_address="0x" + "b" * 40,
-        market_id="0x" + "c" * 64,
         asset_id="asset_123",
         side="BUY",
         price=Decimal("0.65"),
@@ -69,24 +87,24 @@ def sample_trade_event():
         timestamp=datetime.now(UTC),
         outcome="Yes",
         outcome_index=0,
-        event_title="Test Market",
         market_slug="test-market",
+        event_title="Test Market",
     )
 
 
 @pytest.fixture
-def sample_wallet_profile():
-    """Create a sample wallet profile for testing."""
-    return WalletProfile(
+def sample_wallet_snapshot():
+    """Create a sample wallet snapshot for testing."""
+    as_of = datetime.now(UTC)
+    return WalletSnapshot(
         address="0x" + "b" * 40,
-        nonce=2,
-        first_seen=datetime.now(UTC),
-        age_hours=1.5,
-        is_fresh=True,
-        total_tx_count=2,
-        matic_balance=Decimal("100"),
-        usdc_balance=Decimal("5000"),
-        fresh_threshold=5,
+        as_of=as_of,
+        as_of_block_number=123,
+        nonce_as_of=2,
+        matic_balance_wei_as_of=Decimal("100"),
+        usdc_balance_units_as_of=Decimal("5000"),
+        first_funding_at=as_of - timedelta(hours=1.5),
+        age_hours_as_of=1.5,
     )
 
 
@@ -215,8 +233,11 @@ class TestOnTrade:
     async def test_on_trade_increments_stats(self, mock_settings, sample_trade_event):
         """Processing a trade should increment stats."""
         pipeline = Pipeline(mock_settings)
-        pipeline._fresh_wallet_detector = AsyncMock(return_value=None)
-        pipeline._size_anomaly_detector = AsyncMock(return_value=None)
+        pipeline._detect_fresh_wallet = AsyncMock(return_value=None)
+        pipeline._detect_size_anomaly = AsyncMock(return_value=None)
+        pipeline._detect_trade_size_outlier = AsyncMock(return_value=None)
+        pipeline._detect_digit_distribution = AsyncMock(return_value=None)
+        pipeline._detect_trade_slicing = AsyncMock(return_value=None)
 
         await pipeline._on_trade(sample_trade_event)
 
@@ -227,32 +248,34 @@ class TestOnTrade:
     async def test_on_trade_runs_detectors_in_parallel(self, mock_settings, sample_trade_event):
         """Detectors should run in parallel."""
         pipeline = Pipeline(mock_settings)
-        pipeline._fresh_wallet_detector = AsyncMock()
-        pipeline._size_anomaly_detector = AsyncMock()
 
         # Make detectors take some time
         async def slow_detect(*_args):
             await asyncio.sleep(0.1)
             return None
 
-        pipeline._fresh_wallet_detector.analyze = slow_detect
-        pipeline._size_anomaly_detector.analyze = slow_detect
+        pipeline._detect_fresh_wallet = slow_detect
+        pipeline._detect_size_anomaly = slow_detect
+        pipeline._detect_trade_size_outlier = slow_detect
+        pipeline._detect_digit_distribution = slow_detect
+        pipeline._detect_trade_slicing = slow_detect
 
         start = asyncio.get_event_loop().time()
         await pipeline._on_trade(sample_trade_event)
         elapsed = asyncio.get_event_loop().time() - start
 
-        # Should complete in ~0.1s not ~0.2s
+        # Should complete in ~0.1s not ~0.5s
         assert elapsed < 0.15
 
     @pytest.mark.asyncio
     async def test_on_trade_handles_detector_errors(self, mock_settings, sample_trade_event):
         """Should handle detector errors gracefully."""
         pipeline = Pipeline(mock_settings)
-        pipeline._fresh_wallet_detector = MagicMock()
-        pipeline._fresh_wallet_detector.analyze = AsyncMock(side_effect=Exception("Detector error"))
-        pipeline._size_anomaly_detector = MagicMock()
-        pipeline._size_anomaly_detector.analyze = AsyncMock(return_value=None)
+        pipeline._detect_fresh_wallet = AsyncMock(side_effect=Exception("Detector error"))
+        pipeline._detect_size_anomaly = AsyncMock(return_value=None)
+        pipeline._detect_trade_size_outlier = AsyncMock(return_value=None)
+        pipeline._detect_digit_distribution = AsyncMock(return_value=None)
+        pipeline._detect_trade_slicing = AsyncMock(return_value=None)
 
         # Should not raise
         await pipeline._on_trade(sample_trade_event)
@@ -262,7 +285,7 @@ class TestOnTrade:
 
     @pytest.mark.asyncio
     async def test_on_trade_calls_score_and_alert_when_signals(
-        self, mock_settings, sample_trade_event, sample_wallet_profile
+        self, mock_settings, sample_trade_event, sample_wallet_snapshot
     ):
         """Should call score_and_alert when signals are detected."""
         pipeline = Pipeline(mock_settings)
@@ -270,15 +293,16 @@ class TestOnTrade:
         # Create a signal
         fresh_signal = FreshWalletSignal(
             trade_event=sample_trade_event,
-            wallet_profile=sample_wallet_profile,
+            wallet_snapshot=sample_wallet_snapshot,
             confidence=0.8,
             factors={"base": 0.5, "brand_new": 0.2},
         )
 
-        pipeline._fresh_wallet_detector = MagicMock()
-        pipeline._fresh_wallet_detector.analyze = AsyncMock(return_value=fresh_signal)
-        pipeline._size_anomaly_detector = MagicMock()
-        pipeline._size_anomaly_detector.analyze = AsyncMock(return_value=None)
+        pipeline._detect_fresh_wallet = AsyncMock(return_value=fresh_signal)
+        pipeline._detect_size_anomaly = AsyncMock(return_value=None)
+        pipeline._detect_trade_size_outlier = AsyncMock(return_value=None)
+        pipeline._detect_digit_distribution = AsyncMock(return_value=None)
+        pipeline._detect_trade_slicing = AsyncMock(return_value=None)
 
         # Mock score_and_alert
         pipeline._score_and_alert = AsyncMock()
@@ -289,7 +313,6 @@ class TestOnTrade:
         pipeline._score_and_alert.assert_called_once()
         bundle = pipeline._score_and_alert.call_args[0][0]
         assert bundle.fresh_wallet_signal == fresh_signal
-        assert pipeline.stats.signals_generated == 1
 
 
 class TestScoreAndAlert:
@@ -297,7 +320,7 @@ class TestScoreAndAlert:
 
     @pytest.mark.asyncio
     async def test_dry_run_skips_dispatch(
-        self, mock_settings, sample_trade_event, sample_wallet_profile
+        self, mock_settings, sample_trade_event, sample_wallet_snapshot
     ):
         """Dry run should skip actual alert dispatch."""
         mock_settings.dry_run = True
@@ -310,6 +333,7 @@ class TestScoreAndAlert:
                 should_alert=True,
                 wallet_address="0x" + "b" * 40,
                 weighted_score=0.85,
+                signals_triggered=1,
             )
         )
         pipeline._alert_formatter = MagicMock()
@@ -320,7 +344,7 @@ class TestScoreAndAlert:
             trade_event=sample_trade_event,
             fresh_wallet_signal=FreshWalletSignal(
                 trade_event=sample_trade_event,
-                wallet_profile=sample_wallet_profile,
+                wallet_snapshot=sample_wallet_snapshot,
                 confidence=0.8,
                 factors={},
             ),
@@ -342,6 +366,7 @@ class TestScoreAndAlert:
             return_value=MagicMock(
                 should_alert=False,
                 weighted_score=0.4,
+                signals_triggered=0,
             )
         )
         pipeline._alert_formatter = MagicMock()

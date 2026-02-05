@@ -1,6 +1,6 @@
 """Tests for alert message formatter."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -23,7 +23,7 @@ from polymarket_insider_tracker.detector.models import (
     SizeAnomalySignal,
 )
 from polymarket_insider_tracker.ingestor.models import MarketMetadata, Token, TradeEvent
-from polymarket_insider_tracker.profiler.models import WalletProfile
+from polymarket_insider_tracker.profiler.models import WalletSnapshot
 
 # ============================================================================
 # Fixtures
@@ -50,17 +50,18 @@ def sample_trade() -> TradeEvent:
 
 
 @pytest.fixture
-def sample_wallet_profile() -> WalletProfile:
-    """Create a sample wallet profile."""
-    return WalletProfile(
+def sample_wallet_snapshot() -> WalletSnapshot:
+    """Create a sample wallet snapshot."""
+    as_of = datetime.now(UTC)
+    return WalletSnapshot(
         address="0x1234567890abcdef1234567890abcdef12345678",
-        nonce=2,
-        first_seen=datetime.now(UTC),
-        age_hours=2.0,
-        is_fresh=True,
-        total_tx_count=2,
-        matic_balance=Decimal("1000000000000000000"),
-        usdc_balance=Decimal("1000000"),
+        as_of=as_of,
+        as_of_block_number=123,
+        nonce_as_of=2,
+        matic_balance_wei_as_of=Decimal("1000000000000000000"),
+        usdc_balance_units_as_of=Decimal("1000000"),
+        first_funding_at=as_of - timedelta(hours=2),
+        age_hours_as_of=2.0,
     )
 
 
@@ -78,12 +79,12 @@ def sample_metadata() -> MarketMetadata:
 
 @pytest.fixture
 def fresh_wallet_signal(
-    sample_trade: TradeEvent, sample_wallet_profile: WalletProfile
+    sample_trade: TradeEvent, sample_wallet_snapshot: WalletSnapshot
 ) -> FreshWalletSignal:
     """Create a sample fresh wallet signal."""
     return FreshWalletSignal(
         trade_event=sample_trade,
-        wallet_profile=sample_wallet_profile,
+        wallet_snapshot=sample_wallet_snapshot,
         confidence=0.8,
         factors={"base": 0.5, "brand_new_bonus": 0.2, "large_trade_bonus": 0.1},
     )
@@ -96,10 +97,10 @@ def size_anomaly_signal(
     """Create a sample size anomaly signal."""
     return SizeAnomalySignal(
         trade_event=sample_trade,
-        market_metadata=sample_metadata,
+        rolling_24h_volume_usdc=Decimal("100000"),
+        visible_book_depth_usdc=Decimal("50000"),
         volume_impact=0.10,
         book_impact=0.15,
-        is_niche_market=True,
         confidence=0.7,
         factors={"volume_impact": 0.4, "book_impact": 0.3},
     )
@@ -259,7 +260,6 @@ class TestGetTriggeredSignals:
         signals = get_triggered_signals(high_risk_assessment)
         assert "Fresh Wallet" in signals
         assert "Large Position" in signals
-        assert "Niche Market" in signals  # From size anomaly with is_niche_market=True
 
 
 # ============================================================================
@@ -520,22 +520,23 @@ class TestEdgeCases:
     def test_very_short_wallet_age(
         self,
         sample_trade: TradeEvent,
-        sample_wallet_profile: WalletProfile,
+        sample_wallet_snapshot: WalletSnapshot,
     ) -> None:
         """Test formatting with wallet age less than 1 hour."""
-        profile = WalletProfile(
-            address=sample_wallet_profile.address,
-            nonce=sample_wallet_profile.nonce,
-            first_seen=datetime.now(UTC),
-            age_hours=0.5,  # 30 minutes
-            is_fresh=True,
-            total_tx_count=1,
-            matic_balance=sample_wallet_profile.matic_balance,
-            usdc_balance=sample_wallet_profile.usdc_balance,
+        as_of = datetime.now(UTC)
+        snapshot = WalletSnapshot(
+            address=sample_wallet_snapshot.address,
+            as_of=as_of,
+            as_of_block_number=sample_wallet_snapshot.as_of_block_number,
+            nonce_as_of=sample_wallet_snapshot.nonce_as_of,
+            matic_balance_wei_as_of=sample_wallet_snapshot.matic_balance_wei_as_of,
+            usdc_balance_units_as_of=sample_wallet_snapshot.usdc_balance_units_as_of,
+            first_funding_at=as_of - timedelta(minutes=30),
+            age_hours_as_of=0.5,
         )
         signal = FreshWalletSignal(
             trade_event=sample_trade,
-            wallet_profile=profile,
+            wallet_snapshot=snapshot,
             confidence=0.9,
             factors={},
         )
@@ -561,13 +562,13 @@ class TestEdgeCases:
         sample_trade: TradeEvent,
         sample_metadata: MarketMetadata,
     ) -> None:
-        """Test size anomaly signal without niche market flag."""
+        """Test size anomaly signal formatting."""
         signal = SizeAnomalySignal(
             trade_event=sample_trade,
-            market_metadata=sample_metadata,
+            rolling_24h_volume_usdc=Decimal("100000"),
+            visible_book_depth_usdc=Decimal("50000"),
             volume_impact=0.10,
             book_impact=0.15,
-            is_niche_market=False,  # Not niche
             confidence=0.7,
             factors={},
         )
@@ -584,4 +585,3 @@ class TestEdgeCases:
 
         signals = get_triggered_signals(assessment)
         assert "Large Position" in signals
-        assert "Niche Market" not in signals

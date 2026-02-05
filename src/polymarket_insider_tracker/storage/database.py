@@ -24,6 +24,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_async_database_url(database_url: str) -> str:
+    if database_url.startswith("postgresql://"):
+        logger.warning(
+            "Database URL uses sync dialect 'postgresql://'; using async driver 'postgresql+asyncpg://'."
+        )
+        return database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return database_url
+
+
 def create_sync_engine(database_url: str, **kwargs: Any) -> Engine:
     """Create a synchronous SQLAlchemy engine.
 
@@ -47,7 +56,7 @@ def create_async_db_engine(database_url: str, **kwargs: Any) -> AsyncEngine:
     Returns:
         SQLAlchemy AsyncEngine instance.
     """
-    return create_async_engine(database_url, **kwargs)
+    return create_async_engine(_normalize_async_database_url(database_url), **kwargs)
 
 
 def create_sync_session_factory(engine: Engine) -> sessionmaker[Session]:

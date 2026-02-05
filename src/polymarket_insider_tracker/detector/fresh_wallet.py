@@ -9,8 +9,7 @@ from decimal import Decimal
 
 from polymarket_insider_tracker.detector.models import FreshWalletSignal
 from polymarket_insider_tracker.ingestor.models import TradeEvent
-from polymarket_insider_tracker.profiler.analyzer import WalletAnalyzer
-from polymarket_insider_tracker.profiler.models import WalletProfile
+from polymarket_insider_tracker.profiler.models import WalletSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +53,6 @@ class FreshWalletDetector:
 
     def __init__(
         self,
-        wallet_analyzer: WalletAnalyzer,
         *,
         min_trade_size: Decimal = DEFAULT_MIN_TRADE_SIZE,
         max_nonce: int = DEFAULT_MAX_NONCE,
@@ -68,12 +66,16 @@ class FreshWalletDetector:
             max_nonce: Maximum nonce to consider wallet fresh (default 5).
             max_age_hours: Maximum age in hours to consider fresh (default 48).
         """
-        self._analyzer = wallet_analyzer
         self._min_trade_size = min_trade_size
         self._max_nonce = max_nonce
         self._max_age_hours = max_age_hours
 
-    async def analyze(self, trade: TradeEvent) -> FreshWalletSignal | None:
+    async def analyze(
+        self,
+        trade: TradeEvent,
+        *,
+        wallet_snapshot: WalletSnapshot,
+    ) -> FreshWalletSignal | None:
         """Analyze a trade event for fresh wallet signals.
 
         This method:
@@ -99,30 +101,21 @@ class FreshWalletDetector:
             )
             return None
 
-        # Get wallet profile
-        try:
-            profile = await self._analyzer.analyze(trade.wallet_address)
-        except Exception as e:
-            logger.warning(
-                "Failed to analyze wallet %s for trade %s: %s",
-                trade.wallet_address,
-                trade.trade_id,
-                e,
-            )
-            return None
-
         # Check if wallet is fresh
-        if not self._is_wallet_fresh(profile):
+        if wallet_snapshot.address != trade.wallet_address.lower():
+            raise ValueError("wallet_snapshot.address must match trade.wallet_address")
+
+        if not self._is_wallet_fresh(wallet_snapshot):
             logger.debug(
                 "Wallet %s is not fresh (nonce=%d, age=%s)",
                 trade.wallet_address,
-                profile.nonce,
-                profile.age_hours,
+                wallet_snapshot.nonce_as_of,
+                wallet_snapshot.age_hours_as_of,
             )
             return None
 
         # Calculate confidence score
-        confidence, factors = self.calculate_confidence(profile, trade)
+        confidence, factors = self.calculate_confidence(wallet_snapshot, trade)
 
         logger.info(
             "Fresh wallet signal: wallet=%s, market=%s, size=%s, confidence=%.2f",
@@ -134,12 +127,12 @@ class FreshWalletDetector:
 
         return FreshWalletSignal(
             trade_event=trade,
-            wallet_profile=profile,
+            wallet_snapshot=wallet_snapshot,
             confidence=confidence,
             factors=factors,
         )
 
-    def _is_wallet_fresh(self, profile: WalletProfile) -> bool:
+    def _is_wallet_fresh(self, snapshot: WalletSnapshot) -> bool:
         """Check if wallet meets freshness criteria.
 
         A wallet is considered fresh if:
@@ -153,15 +146,14 @@ class FreshWalletDetector:
             True if wallet is fresh.
         """
         # Must have few transactions
-        if profile.nonce > self._max_nonce:
+        if snapshot.nonce_as_of > self._max_nonce:
             return False
 
-        # If age is known, must be recent
-        return not (profile.age_hours is not None and profile.age_hours > self._max_age_hours)
+        return snapshot.age_hours_as_of <= self._max_age_hours
 
     def calculate_confidence(
         self,
-        profile: WalletProfile,
+        snapshot: WalletSnapshot,
         trade: TradeEvent,
     ) -> tuple[float, dict[str, float]]:
         """Calculate confidence score based on multiple factors.
@@ -185,12 +177,12 @@ class FreshWalletDetector:
         confidence = BASE_CONFIDENCE
 
         # Brand new wallet bonus
-        if profile.nonce == 0:
+        if snapshot.nonce_as_of == 0:
             factors["brand_new"] = BRAND_NEW_BONUS
             confidence += BRAND_NEW_BONUS
 
         # Very young wallet bonus
-        if profile.age_hours is not None and profile.age_hours < 2.0:
+        if snapshot.age_hours_as_of < 2.0:
             factors["very_young"] = VERY_YOUNG_BONUS
             confidence += VERY_YOUNG_BONUS
 
@@ -207,6 +199,8 @@ class FreshWalletDetector:
     async def analyze_batch(
         self,
         trades: list[TradeEvent],
+        *,
+        wallet_snapshots: dict[str, WalletSnapshot],
     ) -> list[FreshWalletSignal]:
         """Analyze multiple trades for fresh wallet signals.
 
@@ -220,7 +214,10 @@ class FreshWalletDetector:
         """
         import asyncio
 
-        tasks = [self.analyze(trade) for trade in trades]
+        tasks = [
+            self.analyze(trade, wallet_snapshot=wallet_snapshots[trade.wallet_address.lower()])
+            for trade in trades
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         signals: list[FreshWalletSignal] = []

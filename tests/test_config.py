@@ -12,9 +12,16 @@ from pydantic import ValidationError
 from polymarket_insider_tracker.config import (
     DatabaseSettings,
     DiscordSettings,
+    FreshWalletSettings,
+    FundingSettings,
+    LiquiditySettings,
+    ModelSettings,
     PolygonSettings,
     PolymarketSettings,
     RedisSettings,
+    ScanSettings,
+    SizeAnomalySettings,
+    SniperSettings,
     Settings,
     TelegramSettings,
     clear_settings_cache,
@@ -118,27 +125,47 @@ class TestPolygonSettings:
 class TestPolymarketSettings:
     """Tests for PolymarketSettings."""
 
-    def test_default_ws_url(self) -> None:
-        """Test default Polymarket WebSocket URL."""
+    def test_default_urls(self) -> None:
+        """Test default Polymarket endpoints."""
         with patch.dict(os.environ, {}, clear=True):
             settings = PolymarketSettings()
-            assert "polymarket.com" in settings.ws_url
-            assert settings.api_key is None
+            assert settings.trade_ws_url.startswith("wss://")
+            assert settings.clob_market_ws_url.startswith("wss://")
+            assert settings.clob_host.startswith("https://")
+            assert settings.clob_chain_id == 137
+            assert settings.clob_api_key is None
 
-    def test_custom_api_key(self) -> None:
-        """Test custom API key (secret)."""
-        with patch.dict(os.environ, {"POLYMARKET_API_KEY": "secret-key-123"}):
+    def test_custom_clob_api_key(self) -> None:
+        """Test custom CLOB API key (secret)."""
+        with patch.dict(os.environ, {"POLYMARKET_CLOB_API_KEY": "secret-key-123"}):
             settings = PolymarketSettings()
-            assert settings.api_key is not None
-            assert settings.api_key.get_secret_value() == "secret-key-123"
+            assert settings.clob_api_key is not None
+            assert settings.clob_api_key.get_secret_value() == "secret-key-123"
 
     def test_invalid_ws_url_raises(self) -> None:
         """Test that invalid WebSocket URL raises validation error."""
         with (
-            patch.dict(os.environ, {"POLYMARKET_WS_URL": "http://polymarket.com"}),
+            patch.dict(os.environ, {"POLYMARKET_TRADE_WS_URL": "http://polymarket.com"}),
             pytest.raises(ValidationError, match="ws://"),
         ):
             PolymarketSettings()
+
+
+class TestFreshWalletSettings:
+    def test_defaults(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            s = FreshWalletSettings()
+            assert s.min_trade_notional_usdc > 0
+            assert s.max_nonce >= 0
+            assert s.max_age_hours >= 0
+
+
+class TestSizeAnomalySettings:
+    def test_defaults(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            s = SizeAnomalySettings()
+            assert 0.0 <= s.volume_threshold <= 1.0
+            assert 0.0 <= s.book_threshold <= 1.0
 
 
 class TestDiscordSettings:
@@ -269,6 +296,29 @@ class TestSettings:
         ):
             settings = Settings()
             assert settings.get_logging_level() == logging.WARNING
+
+    def test_nested_settings_defaults_load(self) -> None:
+        """Test new nested settings load with defaults."""
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": "postgresql://user:pass@localhost/db"},
+        ):
+            settings = Settings()
+            assert isinstance(settings.liquidity, LiquiditySettings)
+            assert isinstance(settings.funding, FundingSettings)
+            assert isinstance(settings.sniper, SniperSettings)
+            assert isinstance(settings.scan, ScanSettings)
+            assert isinstance(settings.model, ModelSettings)
+
+    def test_validate_requirements_scan_requires_embeddings(self) -> None:
+        """Test scan/train validation requires embedding model."""
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": "postgresql://user:pass@localhost/db"},
+        ):
+            settings = Settings()
+            with pytest.raises(ValueError, match="SCAN_EMBEDDING_MODEL"):
+                settings.validate_requirements(command="scan")
 
     def test_redacted_summary(self) -> None:
         """Test redacted_summary masks sensitive data."""

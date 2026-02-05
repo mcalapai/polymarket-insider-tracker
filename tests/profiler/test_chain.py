@@ -183,7 +183,7 @@ class TestPolygonClient:
         mock_redis.get = AsyncMock(return_value=b"42")
         client = PolygonClient("https://polygon-rpc.com", redis=mock_redis)
 
-        count = await client.get_transaction_count(VALID_ADDRESS)
+        count = await client.get_transaction_count_latest(VALID_ADDRESS)
 
         assert count == 42
         mock_redis.get.assert_called_once()
@@ -196,7 +196,7 @@ class TestPolygonClient:
         with patch.object(client, "_execute_with_retry", new_callable=AsyncMock) as mock_exec:
             mock_exec.return_value = 42
 
-            count = await client.get_transaction_count(VALID_ADDRESS)
+            count = await client.get_transaction_count_latest(VALID_ADDRESS)
 
             assert count == 42
             mock_exec.assert_called_once()
@@ -208,7 +208,7 @@ class TestPolygonClient:
         mock_redis.get = AsyncMock(side_effect=[b"10", None, b"30"])
         client = PolygonClient("https://polygon-rpc.com", redis=mock_redis)
 
-        with patch.object(client, "get_transaction_count", new_callable=AsyncMock) as mock_get:
+        with patch.object(client, "get_transaction_count_latest", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = 20
 
             addresses = [VALID_ADDRESS, VALID_ADDRESS_2, VALID_ADDRESS_3]
@@ -233,7 +233,7 @@ class TestPolygonClient:
         mock_redis.get = AsyncMock(return_value=b"1000000000000000000")
         client = PolygonClient("https://polygon-rpc.com", redis=mock_redis)
 
-        balance = await client.get_balance(VALID_ADDRESS)
+        balance = await client.get_balance_latest(VALID_ADDRESS)
 
         assert balance == Decimal("1000000000000000000")
 
@@ -245,43 +245,10 @@ class TestPolygonClient:
         with patch.object(client, "_execute_with_retry", new_callable=AsyncMock) as mock_exec:
             mock_exec.return_value = 2000000000000000000
 
-            balance = await client.get_balance(VALID_ADDRESS)
+            balance = await client.get_balance_latest(VALID_ADDRESS)
 
             assert balance == Decimal("2000000000000000000")
             mock_redis.set.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_get_wallet_info(self, mock_redis: AsyncMock) -> None:
-        """Test getting aggregated wallet info."""
-        client = PolygonClient("https://polygon-rpc.com", redis=mock_redis)
-
-        with (
-            patch.object(client, "get_transaction_count", new_callable=AsyncMock) as mock_nonce,
-            patch.object(client, "get_balance", new_callable=AsyncMock) as mock_balance,
-            patch.object(client, "get_first_transaction", new_callable=AsyncMock) as mock_tx,
-        ):
-            mock_nonce.return_value = 42
-            mock_balance.return_value = Decimal("1000000000000000000")
-            mock_tx.return_value = None
-
-            info = await client.get_wallet_info(VALID_ADDRESS)
-
-            assert info.address == VALID_ADDRESS.lower()
-            assert info.transaction_count == 42
-            assert info.balance_wei == Decimal("1000000000000000000")
-            assert info.first_transaction is None
-
-    @pytest.mark.asyncio
-    async def test_get_first_transaction_no_transactions(self, mock_redis: AsyncMock) -> None:
-        """Test get_first_transaction when wallet has no transactions."""
-        client = PolygonClient("https://polygon-rpc.com", redis=mock_redis)
-
-        with patch.object(client, "get_transaction_count", new_callable=AsyncMock) as mock_nonce:
-            mock_nonce.return_value = 0
-
-            tx = await client.get_first_transaction(VALID_ADDRESS)
-
-            assert tx is None
 
     @pytest.mark.asyncio
     async def test_health_check_success(self, mock_redis: AsyncMock) -> None:
@@ -340,7 +307,7 @@ class TestPolygonClientRetryLogic:
 
         client._w3.eth.get_transaction_count = mock_get_tx_count
 
-        count = await client.get_transaction_count(VALID_ADDRESS)
+        count = await client.get_transaction_count_latest(VALID_ADDRESS)
 
         assert count == 42
         assert call_count == 3
@@ -365,7 +332,7 @@ class TestPolygonClientRetryLogic:
         # Fallback works
         client._w3_fallback.eth.get_transaction_count = AsyncMock(return_value=42)
 
-        count = await client.get_transaction_count(VALID_ADDRESS)
+        count = await client.get_transaction_count_latest(VALID_ADDRESS)
 
         assert count == 42
         assert not client._primary_healthy
@@ -386,7 +353,7 @@ class TestPolygonClientRetryLogic:
         client._w3.eth.get_transaction_count = always_fail
 
         with pytest.raises(RPCError):
-            await client.get_transaction_count(VALID_ADDRESS)
+            await client.get_transaction_count_latest(VALID_ADDRESS)
 
 
 class TestPolygonClientRateLimiting:
@@ -412,7 +379,7 @@ class TestPolygonClientRateLimiting:
             mock.return_value = 42
 
             start = asyncio.get_event_loop().time()
-            await client.get_transaction_count(VALID_ADDRESS)
+            await client.get_transaction_count_latest(VALID_ADDRESS)
             elapsed = asyncio.get_event_loop().time() - start
 
             # Should have waited for token refill

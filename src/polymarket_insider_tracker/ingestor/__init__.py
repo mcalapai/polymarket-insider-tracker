@@ -25,7 +25,6 @@ from polymarket_insider_tracker.ingestor.models import (
     OrderbookLevel,
     Token,
     TradeEvent,
-    derive_category,
 )
 from polymarket_insider_tracker.ingestor.publisher import (
     ConsumerGroupExistsError,
@@ -65,7 +64,6 @@ __all__ = [
     "OrderbookLevel",
     "Token",
     "TradeEvent",
-    "derive_category",
     # Publisher
     "ConsumerGroupExistsError",
     "EventPublisher",

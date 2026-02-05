@@ -1,14 +1,15 @@
-"""Funding chain tracer for wallet analysis.
+"""Funding-chain indexing and tracing (bounded and strict).
 
-This module provides the FundingTracer class for tracing the funding chain
-of wallets to identify where their USDC/MATIC originated from.
+This module implements:
+- An on-demand inbound transfer index (`erc20_transfers`) for bounded lookback windows.
+- A strict funding-chain tracer that consumes the index (no genesis scans).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -16,116 +17,243 @@ from web3 import AsyncWeb3
 
 from polymarket_insider_tracker.profiler.entities import EntityRegistry
 from polymarket_insider_tracker.profiler.models import FundingChain, FundingTransfer
+from polymarket_insider_tracker.storage.repos import ERC20TransferDTO, ERC20TransferRepository
 
 if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from polymarket_insider_tracker.profiler.chain import PolygonClient
+    from polymarket_insider_tracker.storage.repos import RelationshipRepository
 
 logger = logging.getLogger(__name__)
 
-# USDC contract addresses on Polygon
-USDC_BRIDGED = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
-
-# ERC20 Transfer event signature
-TRANSFER_EVENT_SIGNATURE = AsyncWeb3.keccak(text="Transfer(address,address,uint256)")
+# ERC20 Transfer(address,address,uint256)
+TRANSFER_EVENT_SIGNATURE = AsyncWeb3.keccak(text="Transfer(address,address,uint256)").hex()
 
 
-class FundingTracer:
-    """Traces funding chains to identify wallet funding sources.
+class FundingTraceError(Exception):
+    """Raised when a funding trace cannot be completed within configured bounds."""
 
-    The tracer follows USDC transfers backwards from a target wallet
-    to find where the funds originated, stopping at known entities
-    (CEX hot wallets, bridges) or reaching the maximum hop count.
 
-    Attributes:
-        polygon_client: Client for Polygon blockchain queries.
-        entity_registry: Registry of known blockchain entities.
-        max_hops: Maximum number of hops to trace (default 3).
-    """
+def _pad_topic_address(address: str) -> str:
+    return "0x" + address.lower().replace("0x", "").zfill(64)
+
+
+def _topic_to_address(topic: Any) -> str:
+    # topic may be HexBytes or bytes-like.
+    hexed = topic.hex() if hasattr(topic, "hex") else str(topic)
+    if hexed.startswith("0x"):
+        hexed = hexed[2:]
+    return ("0x" + hexed[-40:]).lower()
+
+
+@dataclass(frozen=True)
+class IndexWindow:
+    start: datetime
+    end: datetime
+
+
+class ERC20TransferIndexer:
+    """On-demand inbound transfer indexer for a bounded lookback window."""
 
     def __init__(
         self,
         polygon_client: PolygonClient,
-        entity_registry: EntityRegistry | None = None,
         *,
-        max_hops: int = 3,
-        usdc_addresses: list[str] | None = None,
+        token_addresses: list[str],
+        lookback_days: int,
+        logs_chunk_size_blocks: int,
     ) -> None:
-        """Initialize the funding tracer.
+        self._polygon = polygon_client
+        self._token_addresses = [t.lower() for t in token_addresses]
+        self._lookback_days = lookback_days
+        self._chunk = logs_chunk_size_blocks
 
-        Args:
-            polygon_client: Polygon blockchain client for queries.
-            entity_registry: Registry for entity classification. Creates default if None.
-            max_hops: Maximum hops to trace back (default 3).
-            usdc_addresses: USDC contract addresses to track. Uses defaults if None.
-        """
-        self.polygon_client = polygon_client
-        self.entity_registry = entity_registry or EntityRegistry()
-        self.max_hops = max_hops
-        self._usdc_addresses = [
-            addr.lower() for addr in (usdc_addresses or [USDC_BRIDGED, USDC_NATIVE])
-        ]
+    async def index_inbound_transfers(
+        self,
+        session: AsyncSession,
+        *,
+        to_address: str,
+        window: IndexWindow | None = None,
+    ) -> int:
+        to_address = to_address.lower()
+        effective_window = window or IndexWindow(
+            start=datetime.now(UTC) - timedelta(days=self._lookback_days),
+            end=datetime.now(UTC),
+        )
+
+        start_block = await self._polygon.get_block_number_at_or_before(effective_window.start)
+        end_block = await self._polygon.get_block_number_at_or_before(effective_window.end)
+        if end_block < start_block:
+            raise FundingTraceError("Invalid index window (end before start)")
+
+        repo = ERC20TransferRepository(session)
+        inserted_total = 0
+        for token_address in self._token_addresses:
+            inserted_total += await self._index_token_inbound(
+                repo,
+                to_address=to_address,
+                token_address=token_address,
+                start_block=start_block,
+                end_block=end_block,
+            )
+        return inserted_total
+
+    async def _index_token_inbound(
+        self,
+        repo: ERC20TransferRepository,
+        *,
+        to_address: str,
+        token_address: str,
+        start_block: int,
+        end_block: int,
+    ) -> int:
+        dtos: list[ERC20TransferDTO] = []
+        for from_block in range(start_block, end_block + 1, self._chunk):
+            to_block = min(end_block, from_block + self._chunk - 1)
+            logs = await self._polygon.get_logs(
+                {
+                    "address": AsyncWeb3.to_checksum_address(token_address),
+                    "topics": [
+                        TRANSFER_EVENT_SIGNATURE,
+                        None,
+                        _pad_topic_address(to_address),
+                    ],
+                    "fromBlock": from_block,
+                    "toBlock": to_block,
+                }
+            )
+            if not logs:
+                continue
+
+            for log in logs:
+                block_number = int(log["blockNumber"])
+                block = await self._polygon.get_block(block_number)
+                ts = datetime.fromtimestamp(int(block["timestamp"]), tz=UTC)
+                tx_hash = (
+                    log["transactionHash"].hex()
+                    if hasattr(log["transactionHash"], "hex")
+                    else str(log["transactionHash"])
+                )
+                dtos.append(
+                    ERC20TransferDTO(
+                        token_address=token_address,
+                        from_address=_topic_to_address(log["topics"][1]),
+                        to_address=_topic_to_address(log["topics"][2]),
+                        amount_units=Decimal(int(log["data"].hex(), 16)),
+                        tx_hash=tx_hash,
+                        log_index=int(log.get("logIndex") or log.get("log_index") or 0),
+                        block_number=block_number,
+                        timestamp=ts,
+                    )
+                )
+
+        if not dtos:
+            return 0
+        await repo.insert_many(dtos)
+        return len(dtos)
+
+
+class FundingTracer:
+    """Strict funding-chain tracer backed by the transfer index."""
+
+    def __init__(
+        self,
+        polygon_client: PolygonClient,
+        *,
+        token_addresses: list[str],
+        lookback_days: int,
+        logs_chunk_size_blocks: int,
+        max_hops: int = 3,
+        entity_registry: EntityRegistry | None = None,
+    ) -> None:
+        self._polygon = polygon_client
+        self._token_addresses = [t.lower() for t in token_addresses]
+        self._lookback_days = lookback_days
+        self._max_hops = max_hops
+        self._entity_registry = entity_registry or EntityRegistry()
+        self._indexer = ERC20TransferIndexer(
+            polygon_client,
+            token_addresses=self._token_addresses,
+            lookback_days=lookback_days,
+            logs_chunk_size_blocks=logs_chunk_size_blocks,
+        )
+
+    async def ensure_first_inbound_transfer(
+        self,
+        session: AsyncSession,
+        *,
+        address: str,
+        as_of: datetime,
+    ) -> ERC20TransferDTO:
+        if as_of.tzinfo is None:
+            raise ValueError("as_of must be timezone-aware")
+
+        since = as_of - timedelta(days=self._lookback_days)
+        repo = ERC20TransferRepository(session)
+        first = await repo.get_first_transfer_to(
+            address,
+            token_addresses=self._token_addresses,
+            since=since,
+        )
+        if first is not None:
+            return first
+
+        await self._indexer.index_inbound_transfers(
+            session,
+            to_address=address,
+            window=IndexWindow(start=since, end=as_of),
+        )
+
+        first = await repo.get_first_transfer_to(
+            address,
+            token_addresses=self._token_addresses,
+            since=since,
+        )
+        if first is None:
+            raise FundingTraceError(
+                f"No inbound transfer indexed for {address} within {self._lookback_days}d lookback"
+            )
+        return first
 
     async def trace(
         self,
+        session: AsyncSession,
+        *,
         address: str,
+        as_of: datetime,
         max_hops: int | None = None,
     ) -> FundingChain:
-        """Trace the funding chain for a wallet.
-
-        Follows the first USDC transfer into the wallet, then recursively
-        traces the source wallet until reaching a known entity or max hops.
-
-        Args:
-            address: Target wallet address to trace.
-            max_hops: Override default max_hops for this trace.
-
-        Returns:
-            FundingChain with the complete trace result.
-        """
-        effective_max_hops = max_hops if max_hops is not None else self.max_hops
         normalized_address = address.lower()
+        effective_max_hops = max_hops if max_hops is not None else self._max_hops
 
         chain: list[FundingTransfer] = []
-        current_address = normalized_address
+        current = normalized_address
         origin_address = normalized_address
         origin_type = "unknown"
 
-        for hop in range(effective_max_hops):
-            # Check if current address is a known entity
-            if self.entity_registry.is_terminal(current_address):
-                origin_address = current_address
-                origin_type = self.entity_registry.classify(current_address).value
-                logger.debug(
-                    "Trace terminated at known entity: %s (%s)",
-                    current_address,
-                    origin_type,
-                )
+        for _hop in range(effective_max_hops):
+            if self._entity_registry.is_terminal(current):
+                origin_address = current
+                origin_type = self._entity_registry.classify(current).value
                 break
 
-            # Get first USDC transfer into this address
-            transfer = await self.get_first_usdc_transfer(current_address)
-            if transfer is None:
-                logger.debug(
-                    "No USDC transfer found for %s at hop %d",
-                    current_address,
-                    hop,
-                )
-                origin_address = current_address
-                break
-
+            first = await self.ensure_first_inbound_transfer(session, address=current, as_of=as_of)
+            transfer = FundingTransfer(
+                from_address=first.from_address,
+                to_address=first.to_address,
+                amount=first.amount_units,
+                token="USDC",
+                tx_hash=first.tx_hash,
+                block_number=first.block_number,
+                timestamp=first.timestamp,
+            )
             chain.append(transfer)
             origin_address = transfer.from_address
-            current_address = transfer.from_address
+            current = transfer.from_address
 
-            # Check if the source is a known entity
-            if self.entity_registry.is_terminal(origin_address):
-                origin_type = self.entity_registry.classify(origin_address).value
-                logger.debug(
-                    "Trace found terminal entity: %s (%s)",
-                    origin_address,
-                    origin_type,
-                )
+            if self._entity_registry.is_terminal(origin_address):
+                origin_type = self._entity_registry.classify(origin_address).value
                 break
 
         return FundingChain(
@@ -137,190 +265,71 @@ class FundingTracer:
             traced_at=datetime.now(UTC),
         )
 
-    async def get_first_usdc_transfer(
+    async def persist_relationships(
         self,
-        address: str,
-    ) -> FundingTransfer | None:
-        """Get the first USDC transfer into a wallet.
+        session: AsyncSession,
+        chain: FundingChain,
+        *,
+        confidence: Decimal = Decimal("1.0"),
+        shares_funder_time_band_minutes: int = 30,
+        funding_burst_min_wallets: int = 3,
+    ) -> None:
+        """Persist graph edges derived from indexed transfers and trace results."""
+        from polymarket_insider_tracker.storage.repos import RelationshipRepository, WalletRelationshipDTO
 
-        Queries the blockchain for ERC20 Transfer events to the target
-        address for known USDC contracts.
+        repo = RelationshipRepository(session)
+        if not chain.chain:
+            return
 
-        Args:
-            address: Target wallet address.
-
-        Returns:
-            First FundingTransfer if found, None otherwise.
-        """
-        normalized = address.lower()
-
-        # Query transfers for each USDC contract
-        for usdc_address in self._usdc_addresses:
-            transfer = await self._get_first_token_transfer(
-                to_address=normalized,
-                token_address=usdc_address,
-            )
-            if transfer is not None:
-                return transfer
-
-        return None
-
-    async def _get_first_token_transfer(
-        self,
-        to_address: str,
-        token_address: str,
-    ) -> FundingTransfer | None:
-        """Get the first ERC20 transfer to an address for a specific token.
-
-        Args:
-            to_address: Recipient wallet address.
-            token_address: ERC20 token contract address.
-
-        Returns:
-            First FundingTransfer if found, None otherwise.
-        """
-        try:
-            logs = await self._get_transfer_logs(
-                to_address=to_address,
-                token_address=token_address,
-                limit=1,
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to get transfer logs for %s: %s",
-                to_address,
-                e,
-            )
-            return None
-
-        if not logs:
-            return None
-
-        log = logs[0]
-        return await self._log_to_funding_transfer(log, token_address)
-
-    async def _get_transfer_logs(
-        self,
-        to_address: str,
-        token_address: str,
-        limit: int = 10,
-        from_block: int | str = 0,
-        to_block: int | str = "latest",
-    ) -> list[dict[str, Any]]:
-        """Get ERC20 Transfer event logs.
-
-        Args:
-            to_address: Filter by recipient address.
-            token_address: ERC20 token contract address.
-            limit: Maximum logs to return.
-            from_block: Starting block number.
-            to_block: Ending block number.
-
-        Returns:
-            List of log dictionaries.
-        """
-        # Pad address to 32 bytes for topic filter
-        padded_to = "0x" + to_address.lower().replace("0x", "").zfill(64)
-
-        await self.polygon_client._rate_limiter.acquire()
-
-        # Use the web3 instance from polygon client
-        w3 = (
-            self.polygon_client._w3
-            if self.polygon_client._primary_healthy
-            else (self.polygon_client._w3_fallback or self.polygon_client._w3)
-        )
-
-        # Get logs with Transfer event filtering by recipient
-        # Note: web3 typing is overly restrictive for block params
-        logs = await w3.eth.get_logs(
-            {
-                "address": AsyncWeb3.to_checksum_address(token_address),
-                "topics": [
-                    TRANSFER_EVENT_SIGNATURE.hex(),  # Transfer event
-                    None,  # from (any)
-                    padded_to,  # to (target address)
-                ],
-                "fromBlock": from_block,  # type: ignore[typeddict-item]
-                "toBlock": to_block,  # type: ignore[typeddict-item]
-            }
-        )
-
-        # Convert to list of dicts and limit
-        result = [dict(log) for log in logs[:limit]]
-        return result
-
-    async def _log_to_funding_transfer(
-        self,
-        log: dict[str, Any],
-        token_address: str,
-    ) -> FundingTransfer:
-        """Convert a log entry to a FundingTransfer.
-
-        Args:
-            log: Log dictionary from get_logs.
-            token_address: Token contract address.
-
-        Returns:
-            FundingTransfer object.
-        """
-        # Extract addresses from topics (padded to 32 bytes)
-        from_address = "0x" + log["topics"][1].hex()[-40:]
-        to_address = "0x" + log["topics"][2].hex()[-40:]
-
-        # Extract amount from data
-        amount = int(log["data"].hex(), 16)
-
-        # Get block timestamp
-        block_number = log["blockNumber"]
-        try:
-            block = await self.polygon_client.get_block(block_number)
-            timestamp = datetime.fromtimestamp(block["timestamp"], tz=UTC)
-        except Exception:
-            timestamp = datetime.now(UTC)
-
-        # Determine token symbol
-        token = "USDC" if token_address.lower() in self._usdc_addresses else "OTHER"
-
-        return FundingTransfer(
-            from_address=from_address.lower(),
-            to_address=to_address.lower(),
-            amount=Decimal(amount),
-            token=token,
-            tx_hash=log["transactionHash"].hex(),
-            block_number=block_number,
-            timestamp=timestamp,
-        )
-
-    async def get_funding_chains_batch(
-        self,
-        addresses: list[str],
-        max_hops: int | None = None,
-    ) -> dict[str, FundingChain]:
-        """Trace funding chains for multiple addresses concurrently.
-
-        Args:
-            addresses: List of wallet addresses to trace.
-            max_hops: Override default max_hops for all traces.
-
-        Returns:
-            Dictionary mapping address to FundingChain.
-        """
-        tasks = [self.trace(addr, max_hops=max_hops) for addr in addresses]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        chains: dict[str, FundingChain] = {}
-        for addr, result in zip(addresses, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.warning("Failed to trace %s: %s", addr, result)
-                chains[addr.lower()] = FundingChain(
-                    target_address=addr.lower(),
-                    origin_type="error",
+        # funded_by edges for each hop
+        for transfer in chain.chain:
+            await repo.upsert(
+                WalletRelationshipDTO(
+                    wallet_a=transfer.to_address.lower(),
+                    wallet_b=transfer.from_address.lower(),
+                    relationship_type="funded_by",
+                    confidence=confidence,
                 )
-            else:
-                chains[addr.lower()] = result
+            )
 
-        return chains
+        # Derive shares_funder + funding_burst from the first hop.
+        first = chain.chain[0]
+        band = timedelta(minutes=shares_funder_time_band_minutes)
+        start = first.timestamp - band
+        end = first.timestamp + band
+
+        transfer_repo = ERC20TransferRepository(session)
+        candidates = await transfer_repo.list_transfers_from_in_window(
+            first.from_address,
+            token_addresses=self._token_addresses,
+            start=start,
+            end=end,
+        )
+        recipients = {t.to_address.lower() for t in candidates}
+        if len(recipients) >= funding_burst_min_wallets:
+            burst_conf = Decimal(str(min(1.0, len(recipients) / 10.0)))
+            for wallet in recipients:
+                await repo.upsert(
+                    WalletRelationshipDTO(
+                        wallet_a=wallet,
+                        wallet_b=first.from_address.lower(),
+                        relationship_type="funding_burst",
+                        confidence=burst_conf,
+                    )
+                )
+
+        recipients_sorted = sorted(recipients)
+        for i in range(len(recipients_sorted)):
+            for j in range(i + 1, len(recipients_sorted)):
+                a, b = recipients_sorted[i], recipients_sorted[j]
+                await repo.upsert(
+                    WalletRelationshipDTO(
+                        wallet_a=a,
+                        wallet_b=b,
+                        relationship_type="shares_funder",
+                        confidence=Decimal("0.70"),
+                    )
+                )
 
     def get_suspiciousness_score(self, chain: FundingChain) -> float:
         """Calculate a suspiciousness score based on funding chain.
@@ -345,15 +354,15 @@ class FundingTracer:
             # Bridge origin is slightly more suspicious
             return 0.3
 
-        # Unknown origin
+        # Unknown/other terminal origins (contracts, EOA funders, etc.).
         if chain.hop_count == 0:
-            # No transfers found - very suspicious (possible contract or new wallet)
-            return 1.0
+            # This can happen when the target itself is a terminal entity that's
+            # not a CEX/bridge (or when tracing starts at a known contract).
+            return 0.6
 
-        if chain.hop_count >= self.max_hops:
-            # Max hops reached without finding known entity
-            # More hops = more obfuscation = more suspicious
-            return 0.7
+        if chain.hop_count >= self._max_hops:
+            # Max hops reached without finding a CEX/bridge.
+            return 0.75
 
-        # Some hops but didn't reach max - moderately suspicious
-        return 0.5 + (0.3 * (1 - chain.hop_count / self.max_hops))
+        # Fewer hops without reaching a terminal entity is more suspicious.
+        return 0.55 + (0.2 * (1 - chain.hop_count / self._max_hops))

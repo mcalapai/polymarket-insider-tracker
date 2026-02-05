@@ -1,6 +1,6 @@
 """Tests for composite risk scorer."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -19,7 +19,7 @@ from polymarket_insider_tracker.detector.scorer import (
     SignalBundle,
 )
 from polymarket_insider_tracker.ingestor.models import MarketMetadata, Token, TradeEvent
-from polymarket_insider_tracker.profiler.models import WalletProfile
+from polymarket_insider_tracker.profiler.models import WalletSnapshot
 
 # ============================================================================
 # Fixtures
@@ -55,17 +55,18 @@ def sample_trade() -> TradeEvent:
 
 
 @pytest.fixture
-def sample_wallet_profile() -> WalletProfile:
-    """Create a sample wallet profile."""
-    return WalletProfile(
+def sample_wallet_snapshot() -> WalletSnapshot:
+    """Create a sample wallet snapshot."""
+    as_of = datetime.now(UTC)
+    return WalletSnapshot(
         address="0x1234567890abcdef1234567890abcdef12345678",
-        nonce=2,
-        first_seen=datetime.now(UTC),
-        age_hours=1.0,
-        is_fresh=True,
-        total_tx_count=2,
-        matic_balance=Decimal("1000000000000000000"),  # 1 MATIC
-        usdc_balance=Decimal("1000000"),  # 1 USDC
+        as_of=as_of,
+        as_of_block_number=123,
+        nonce_as_of=2,
+        matic_balance_wei_as_of=Decimal("1000000000000000000"),  # 1 MATIC
+        usdc_balance_units_as_of=Decimal("1000000"),  # 1 USDC
+        first_funding_at=as_of - timedelta(hours=1),
+        age_hours_as_of=1.0,
     )
 
 
@@ -83,12 +84,12 @@ def sample_metadata() -> MarketMetadata:
 
 @pytest.fixture
 def fresh_wallet_signal(
-    sample_trade: TradeEvent, sample_wallet_profile: WalletProfile
+    sample_trade: TradeEvent, sample_wallet_snapshot: WalletSnapshot
 ) -> FreshWalletSignal:
     """Create a sample fresh wallet signal."""
     return FreshWalletSignal(
         trade_event=sample_trade,
-        wallet_profile=sample_wallet_profile,
+        wallet_snapshot=sample_wallet_snapshot,
         confidence=0.8,
         factors={"base": 0.5, "brand_new_bonus": 0.2, "large_trade_bonus": 0.1},
     )
@@ -101,10 +102,10 @@ def size_anomaly_signal(
     """Create a sample size anomaly signal."""
     return SizeAnomalySignal(
         trade_event=sample_trade,
-        market_metadata=sample_metadata,
+        rolling_24h_volume_usdc=Decimal("100000"),
+        visible_book_depth_usdc=Decimal("50000"),
         volume_impact=0.10,
         book_impact=0.15,
-        is_niche_market=True,
         confidence=0.7,
         factors={"volume_impact": 0.4, "book_impact": 0.3},
     )
@@ -353,24 +354,23 @@ class TestWeightedScoreCalculation:
 
         score, count = scorer.calculate_weighted_score(bundle)
 
-        # 0.7 confidence * 0.35 weight + 0.7 * 0.25 niche weight = 0.42
-        expected = 0.7 * DEFAULT_WEIGHTS["size_anomaly"] + 0.7 * DEFAULT_WEIGHTS["niche_market"]
+        expected = 0.7 * DEFAULT_WEIGHTS["size_anomaly"]
         assert score == pytest.approx(expected)
         assert count == 1
 
-    def test_size_anomaly_non_niche(
+    def test_size_anomaly_minimal(
         self,
         mock_redis: AsyncMock,
         sample_trade: TradeEvent,
         sample_metadata: MarketMetadata,
     ) -> None:
-        """Test size anomaly without niche bonus."""
+        """Test size anomaly scoring."""
         signal = SizeAnomalySignal(
             trade_event=sample_trade,
-            market_metadata=sample_metadata,
+            rolling_24h_volume_usdc=Decimal("100000"),
+            visible_book_depth_usdc=Decimal("50000"),
             volume_impact=0.10,
             book_impact=0.15,
-            is_niche_market=False,
             confidence=0.7,
             factors={},
         )
@@ -382,7 +382,6 @@ class TestWeightedScoreCalculation:
 
         score, count = scorer.calculate_weighted_score(bundle)
 
-        # 0.7 * 0.35 = 0.245 (no niche bonus)
         expected = 0.7 * DEFAULT_WEIGHTS["size_anomaly"]
         assert score == pytest.approx(expected)
 
@@ -407,7 +406,6 @@ class TestWeightedScoreCalculation:
         base = (
             0.8 * DEFAULT_WEIGHTS["fresh_wallet"]
             + 0.7 * DEFAULT_WEIGHTS["size_anomaly"]
-            + 0.7 * DEFAULT_WEIGHTS["niche_market"]
         )
         expected = base * MULTI_SIGNAL_BONUS_2
         assert score == pytest.approx(expected)
@@ -417,23 +415,23 @@ class TestWeightedScoreCalculation:
         self,
         mock_redis: AsyncMock,
         sample_trade: TradeEvent,
-        sample_wallet_profile: WalletProfile,
+        sample_wallet_snapshot: WalletSnapshot,
         sample_metadata: MarketMetadata,
     ) -> None:
         """Test score is capped at 1.0."""
         # Create high confidence signals
         fresh_signal = FreshWalletSignal(
             trade_event=sample_trade,
-            wallet_profile=sample_wallet_profile,
+            wallet_snapshot=sample_wallet_snapshot,
             confidence=1.0,
             factors={},
         )
         size_signal = SizeAnomalySignal(
             trade_event=sample_trade,
-            market_metadata=sample_metadata,
+            rolling_24h_volume_usdc=Decimal("100000"),
+            visible_book_depth_usdc=Decimal("50000"),
             volume_impact=0.10,
             book_impact=0.15,
-            is_niche_market=True,
             confidence=1.0,
             factors={},
         )
@@ -596,7 +594,7 @@ class TestBatchAnalysis:
     async def test_assess_batch(
         self,
         mock_redis: AsyncMock,
-        sample_wallet_profile: WalletProfile,
+        sample_wallet_snapshot: WalletSnapshot,
     ) -> None:
         """Test batch assessment returns assessments for all bundles."""
         scorer = RiskScorer(mock_redis)
@@ -617,7 +615,7 @@ class TestBatchAnalysis:
             )
             signal = FreshWalletSignal(
                 trade_event=trade,
-                wallet_profile=sample_wallet_profile,
+                wallet_snapshot=sample_wallet_snapshot,
                 confidence=0.8,
                 factors={},
             )

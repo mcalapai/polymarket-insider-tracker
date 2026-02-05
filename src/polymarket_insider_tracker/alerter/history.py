@@ -98,8 +98,20 @@ def _get_signals_from_assessment(assessment: RiskAssessment) -> list[str]:
         signals.append("fresh_wallet")
     if assessment.size_anomaly_signal:
         signals.append("size_anomaly")
-        if assessment.size_anomaly_signal.is_niche_market:
-            signals.append("niche_market")
+    if assessment.sniper_cluster_signal:
+        signals.append("sniper_cluster")
+    if getattr(assessment, "coentry_signal", None):
+        signals.append("coentry")
+    if getattr(assessment, "funding_signal", None):
+        signals.append("funding")
+    if getattr(assessment, "pre_move_signal", None):
+        signals.append("pre_move")
+    if getattr(assessment, "trade_size_outlier_signal", None):
+        signals.append("trade_size_outlier")
+    if getattr(assessment, "digit_distribution_signal", None):
+        signals.append("digit_distribution")
+    if getattr(assessment, "trade_slicing_signal", None):
+        signals.append("trade_slicing")
     return signals
 
 

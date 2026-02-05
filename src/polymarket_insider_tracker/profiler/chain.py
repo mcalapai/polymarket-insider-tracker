@@ -14,7 +14,7 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
 
@@ -23,7 +23,6 @@ from web3 import AsyncWeb3
 from web3.exceptions import Web3Exception
 from web3.providers import AsyncHTTPProvider
 
-from polymarket_insider_tracker.profiler.models import Transaction, WalletInfo
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +33,9 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY_SECONDS = 1.0
 DEFAULT_CONNECTION_POOL_SIZE = 10
 DEFAULT_REQUEST_TIMEOUT = 30
+
+# Cache TTL for latest block (fast-changing)
+LATEST_BLOCK_CACHE_TTL_SECONDS = 2
 
 
 class PolygonClientError(Exception):
@@ -106,7 +108,7 @@ class PolygonClient:
         )
 
         # Get single wallet info
-        nonce = await client.get_transaction_count("0x...")
+        nonce = await client.get_transaction_count_latest("0x...")
 
         # Batch query multiple wallets
         nonces = await client.get_transaction_counts(["0x...", "0x..."])
@@ -162,6 +164,9 @@ class PolygonClient:
     def _cache_key(self, key_type: str, address: str) -> str:
         """Generate a cache key."""
         return f"{self._cache_prefix}{key_type}:{address.lower()}"
+
+    def _cache_key_with_suffix(self, key_type: str, address: str, *, suffix: str) -> str:
+        return f"{self._cache_prefix}{key_type}:{address.lower()}:{suffix}"
 
     async def _get_cached(self, key: str) -> str | None:
         """Get value from cache."""
@@ -269,8 +274,8 @@ class PolygonClient:
 
         raise RPCError(f"RPC call {func_name} failed after all retries: {last_error}")
 
-    async def get_transaction_count(self, address: str) -> int:
-        """Get wallet transaction count (nonce).
+    async def get_transaction_count_latest(self, address: str) -> int:
+        """Get latest wallet transaction count (nonce).
 
         Args:
             address: Wallet address.
@@ -294,6 +299,33 @@ class PolygonClient:
         # Cache result
         await self._set_cached(cache_key, str(count))
 
+        return int(count)
+
+    async def get_transaction_count(self, address: str, *, block_number: int) -> int:
+        """Get wallet transaction count (nonce) as-of a specific block.
+
+        Args:
+            address: Wallet address.
+            block_number: Block number to query at.
+
+        Returns:
+            Transaction count as of that block.
+        """
+        if block_number < 0:
+            raise ValueError("block_number must be >= 0")
+
+        cache_key = self._cache_key_with_suffix("nonce", address, suffix=str(block_number))
+        cached = await self._get_cached(cache_key)
+        if cached is not None:
+            return int(cached)
+
+        count = await self._execute_with_retry(
+            "get_transaction_count",
+            AsyncWeb3.to_checksum_address(address),
+            block_number,
+        )
+
+        await self._set_cached(cache_key, str(count))
         return int(count)
 
     async def get_transaction_counts(
@@ -323,22 +355,20 @@ class PolygonClient:
             else:
                 uncached.append(address)
 
-        # Query uncached addresses concurrently
+        # Query uncached addresses concurrently (latest counts only)
         if uncached:
-            tasks = [self.get_transaction_count(addr) for addr in uncached]
+            tasks = [self.get_transaction_count_latest(addr) for addr in uncached]
             counts = await asyncio.gather(*tasks, return_exceptions=True)
 
             for addr, count in zip(uncached, counts, strict=True):
                 if isinstance(count, BaseException):
-                    logger.warning("Failed to get nonce for %s: %s", addr, count)
-                    results[addr.lower()] = 0
-                else:
-                    results[addr.lower()] = count
+                    raise RPCError(f"Failed to get nonce for {addr}: {count}") from count
+                results[addr.lower()] = count
 
         return results
 
-    async def get_balance(self, address: str) -> Decimal:
-        """Get wallet MATIC balance in Wei.
+    async def get_balance_latest(self, address: str) -> Decimal:
+        """Get latest wallet MATIC balance in Wei.
 
         Args:
             address: Wallet address.
@@ -364,12 +394,30 @@ class PolygonClient:
 
         return Decimal(balance)
 
+    async def get_balance(self, address: str, *, block_number: int) -> Decimal:
+        """Get wallet MATIC balance in Wei as-of a specific block."""
+        if block_number < 0:
+            raise ValueError("block_number must be >= 0")
+
+        cache_key = self._cache_key_with_suffix("balance", address, suffix=str(block_number))
+        cached = await self._get_cached(cache_key)
+        if cached is not None:
+            return Decimal(cached)
+
+        balance = await self._execute_with_retry(
+            "get_balance",
+            AsyncWeb3.to_checksum_address(address),
+            block_number,
+        )
+        await self._set_cached(cache_key, str(balance))
+        return Decimal(balance)
+
     async def get_token_balance(
         self,
         address: str,
         token_address: str,
     ) -> Decimal:
-        """Get ERC20 token balance.
+        """Get latest ERC20 token balance.
 
         Args:
             address: Wallet address.
@@ -396,25 +444,79 @@ class PolygonClient:
             }
         ]
 
-        await self._rate_limiter.acquire()
-
-        try:
-            w3 = self._w3 if self._primary_healthy else (self._w3_fallback or self._w3)
-            contract = w3.eth.contract(
-                address=AsyncWeb3.to_checksum_address(token_address),
-                abi=erc20_abi,
-            )
-            balance = await contract.functions.balanceOf(
-                AsyncWeb3.to_checksum_address(address)
-            ).call()
-        except Web3Exception as e:
-            raise RPCError(f"Failed to get token balance: {e}") from e
+        balance = await self._call_erc20_balance_of(
+            holder_address=address,
+            token_address=token_address,
+            erc20_abi=erc20_abi,
+            block_identifier="latest",
+        )
 
         # Cache result
         await self._set_cached(cache_key, str(balance))
 
         return Decimal(balance)
 
+    async def get_token_balance_at_block(
+        self,
+        address: str,
+        token_address: str,
+        *,
+        block_number: int,
+    ) -> Decimal:
+        """Get ERC20 token balance as-of a specific block."""
+        if block_number < 0:
+            raise ValueError("block_number must be >= 0")
+
+        cache_key = self._cache_key_with_suffix(
+            f"token:{token_address.lower()}",
+            address,
+            suffix=str(block_number),
+        )
+        cached = await self._get_cached(cache_key)
+        if cached is not None:
+            return Decimal(cached)
+
+        erc20_abi = [
+            {
+                "constant": True,
+                "inputs": [{"name": "_owner", "type": "address"}],
+                "name": "balanceOf",
+                "outputs": [{"name": "balance", "type": "uint256"}],
+                "type": "function",
+            }
+        ]
+        balance = await self._call_erc20_balance_of(
+            holder_address=address,
+            token_address=token_address,
+            erc20_abi=erc20_abi,
+            block_identifier=block_number,
+        )
+
+        await self._set_cached(cache_key, str(balance))
+        return Decimal(balance)
+
+    async def _call_erc20_balance_of(
+        self,
+        *,
+        holder_address: str,
+        token_address: str,
+        erc20_abi: list[dict[str, Any]],
+        block_identifier: int | str,
+    ) -> int:
+        await self._rate_limiter.acquire()
+        try:
+            w3 = self._w3 if self._primary_healthy else (self._w3_fallback or self._w3)
+            contract = w3.eth.contract(
+                address=AsyncWeb3.to_checksum_address(token_address),
+                abi=erc20_abi,
+            )
+            # web3's AsyncContractFunction supports block_identifier for historical state
+            balance = await contract.functions.balanceOf(
+                AsyncWeb3.to_checksum_address(holder_address)
+            ).call(block_identifier=block_identifier)
+        except Web3Exception as e:
+            raise RPCError(f"Failed to get token balance: {e}") from e
+        return int(balance)
     async def get_block(self, block_number: int) -> dict[str, Any]:
         """Get block by number.
 
@@ -442,75 +544,72 @@ class PolygonClient:
 
         return dict(block_dict)
 
-    async def get_first_transaction(self, address: str) -> Transaction | None:
-        """Get the first transaction for a wallet.
+    async def get_logs(self, filter_params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Fetch logs via `eth_getLogs` with retry/failover semantics.
 
-        This is useful for determining wallet age. Note: This is an expensive
-        operation as it may require scanning transaction history.
-
-        Args:
-            address: Wallet address.
-
-        Returns:
-            First transaction or None if no transactions.
+        This is the only supported way to access logs; callers must not reach
+        into internal web3 instances.
         """
-        cache_key = self._cache_key("first_tx", address)
+        logs = await self._execute_with_retry("get_logs", filter_params)
+        return [dict(log) for log in logs]
 
-        # Check cache
+    async def get_latest_block(self) -> dict[str, Any]:
+        """Get the latest block.
+
+        Uses a very short cache TTL to avoid over-querying the RPC.
+        """
+        cache_key = f"{self._cache_prefix}block:latest"
         cached = await self._get_cached(cache_key)
         if cached is not None:
-            if cached == "null":
-                return None
-            data = json.loads(cached)
-            return Transaction(
-                hash=data["hash"],
-                block_number=data["block_number"],
-                timestamp=datetime.fromisoformat(data["timestamp"]),
-                from_address=data["from_address"],
-                to_address=data["to_address"],
-                value=Decimal(data["value"]),
-                gas_used=data["gas_used"],
-                gas_price=Decimal(data["gas_price"]),
-            )
+            return cast(dict[str, Any], json.loads(cached))
 
-        # Check if wallet has any transactions
-        nonce = await self.get_transaction_count(address)
-        if nonce == 0:
-            await self._set_cached(cache_key, "null", ttl=60)  # Short TTL for empty
-            return None
+        block = await self._execute_with_retry("get_block", "latest")
 
-        # Note: Getting the actual first transaction requires using an indexer
-        # or scanning blocks, which is expensive. For now, we'll return None
-        # and recommend using an indexer service for production.
-        logger.warning(
-            "get_first_transaction requires an indexer service for %s (nonce=%d)",
-            address,
-            nonce,
-        )
-        return None
+        block_dict = dict(block)
+        block_dict["timestamp"] = int(block_dict["timestamp"])
 
-    async def get_wallet_info(self, address: str) -> WalletInfo:
-        """Get aggregated wallet information.
+        # Cache briefly
+        await self._set_cached(cache_key, json.dumps(block_dict), ttl=LATEST_BLOCK_CACHE_TTL_SECONDS)
+        return dict(block_dict)
 
-        Args:
-            address: Wallet address.
+    async def get_block_number_at_or_before(self, ts: datetime) -> int:
+        """Resolve a timestamp to the latest block at-or-before it.
 
-        Returns:
-            WalletInfo with transaction count, balance, and first transaction.
+        This is a strict, deterministic helper used to compute "as-of" wallet
+        snapshots for trade-time analysis.
         """
-        # Fetch data concurrently
-        nonce_task = self.get_transaction_count(address)
-        balance_task = self.get_balance(address)
-        first_tx_task = self.get_first_transaction(address)
+        if ts.tzinfo is None:
+            raise ValueError("timestamp must be timezone-aware")
 
-        nonce, balance, first_tx = await asyncio.gather(nonce_task, balance_task, first_tx_task)
+        target = int(ts.timestamp())
 
-        return WalletInfo(
-            address=address.lower(),
-            transaction_count=nonce,
-            balance_wei=balance,
-            first_transaction=first_tx,
-        )
+        genesis = await self.get_block(0)
+        genesis_ts = int(genesis["timestamp"])
+        if target <= genesis_ts:
+            return 0
+
+        latest = await self.get_latest_block()
+        latest_number = int(latest["number"])
+        latest_ts = int(latest["timestamp"])
+        if target >= latest_ts:
+            return latest_number
+
+        lo = 0
+        hi = latest_number
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            mid_block = await self.get_block(mid)
+            mid_ts = int(mid_block["timestamp"])
+            if mid_ts <= target:
+                lo = mid
+            else:
+                hi = mid
+
+        # Sanity check the invariant
+        resolved = await self.get_block(lo)
+        if int(resolved["timestamp"]) > target:
+            raise RPCError("Block search invariant violated (resolved block after target)")
+        return lo
 
     async def health_check(self) -> bool:
         """Check if the client can connect to the RPC.

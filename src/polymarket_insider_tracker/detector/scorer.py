@@ -11,8 +11,19 @@ from datetime import UTC, datetime
 from redis.asyncio import Redis
 
 from polymarket_insider_tracker.detector.models import (
+    BookImpactWithoutFillSignal,
+    CoEntryCorrelationSignal,
     FreshWalletSignal,
+    FundingChainSignal,
+    ModelScoreSignal,
+    OrderToTradeRatioSignal,
+    PreMoveSignal,
+    RapidCancelSignal,
     RiskAssessment,
+    SniperClusterSignal,
+    TradeSizeOutlierSignal,
+    DigitDistributionSignal,
+    TradeSlicingSignal,
     SizeAnomalySignal,
 )
 from polymarket_insider_tracker.ingestor.models import TradeEvent
@@ -26,9 +37,19 @@ DEFAULT_REDIS_KEY_PREFIX = "polymarket:dedup:"
 
 # Default weights for each signal type
 DEFAULT_WEIGHTS = {
-    "fresh_wallet": 0.40,
-    "size_anomaly": 0.35,
-    "niche_market": 0.25,
+    "fresh_wallet": 0.30,
+    "size_anomaly": 0.25,
+    "sniper_cluster": 0.20,
+    "coentry": 0.05,
+    "funding": 0.20,
+    "pre_move": 0.0,
+    "trade_size_outlier": 0.0,
+    "digit_distribution": 0.0,
+    "trade_slicing": 0.0,
+    "order_to_trade_ratio": 0.05,
+    "rapid_cancel": 0.05,
+    "book_impact_without_fill": 0.10,
+    "model_score": 0.10,
 }
 
 # Multi-signal bonuses
@@ -46,6 +67,17 @@ class SignalBundle:
     trade_event: TradeEvent
     fresh_wallet_signal: FreshWalletSignal | None = None
     size_anomaly_signal: SizeAnomalySignal | None = None
+    sniper_cluster_signal: SniperClusterSignal | None = None
+    coentry_signal: CoEntryCorrelationSignal | None = None
+    funding_signal: FundingChainSignal | None = None
+    pre_move_signal: PreMoveSignal | None = None
+    trade_size_outlier_signal: TradeSizeOutlierSignal | None = None
+    digit_distribution_signal: DigitDistributionSignal | None = None
+    trade_slicing_signal: TradeSlicingSignal | None = None
+    order_to_trade_ratio_signal: OrderToTradeRatioSignal | None = None
+    rapid_cancel_signal: RapidCancelSignal | None = None
+    book_impact_without_fill_signal: BookImpactWithoutFillSignal | None = None
+    model_score_signal: ModelScoreSignal | None = None
 
     @property
     def wallet_address(self) -> str:
@@ -174,6 +206,17 @@ class RiskScorer:
             market_id=bundle.market_id,
             fresh_wallet_signal=bundle.fresh_wallet_signal,
             size_anomaly_signal=bundle.size_anomaly_signal,
+            sniper_cluster_signal=bundle.sniper_cluster_signal,
+            coentry_signal=bundle.coentry_signal,
+            funding_signal=bundle.funding_signal,
+            pre_move_signal=bundle.pre_move_signal,
+            trade_size_outlier_signal=bundle.trade_size_outlier_signal,
+            digit_distribution_signal=bundle.digit_distribution_signal,
+            trade_slicing_signal=bundle.trade_slicing_signal,
+            order_to_trade_ratio_signal=bundle.order_to_trade_ratio_signal,
+            rapid_cancel_signal=bundle.rapid_cancel_signal,
+            book_impact_without_fill_signal=bundle.book_impact_without_fill_signal,
+            model_score_signal=bundle.model_score_signal,
             signals_triggered=signals_triggered,
             weighted_score=weighted_score,
             should_alert=should_alert,
@@ -205,10 +248,64 @@ class RiskScorer:
             score += bundle.size_anomaly_signal.confidence * weight
             signals_triggered += 1
 
-            # Additional niche market weight
-            if bundle.size_anomaly_signal.is_niche_market:
-                niche_weight = self._weights.get("niche_market", 0.0)
-                score += bundle.size_anomaly_signal.confidence * niche_weight
+        # Sniper clustering
+        if bundle.sniper_cluster_signal is not None:
+            weight = self._weights.get("sniper_cluster", 0.0)
+            score += bundle.sniper_cluster_signal.confidence * weight
+            signals_triggered += 1
+
+        # Co-entry correlation (low-weight coordination signal)
+        if bundle.coentry_signal is not None:
+            weight = self._weights.get("coentry", 0.0)
+            score += bundle.coentry_signal.confidence * weight
+            signals_triggered += 1
+
+        # Funding origin suspiciousness (on-demand)
+        if bundle.funding_signal is not None:
+            weight = self._weights.get("funding", 0.0)
+            score += bundle.funding_signal.confidence * weight
+            signals_triggered += 1
+
+        # Pre-move (historical only by default)
+        if bundle.pre_move_signal is not None:
+            weight = self._weights.get("pre_move", 0.0)
+            score += bundle.pre_move_signal.confidence * weight
+            signals_triggered += 1
+
+        if bundle.trade_size_outlier_signal is not None:
+            weight = self._weights.get("trade_size_outlier", 0.0)
+            score += bundle.trade_size_outlier_signal.confidence * weight
+            signals_triggered += 1
+
+        if bundle.digit_distribution_signal is not None:
+            weight = self._weights.get("digit_distribution", 0.0)
+            score += bundle.digit_distribution_signal.confidence * weight
+            signals_triggered += 1
+
+        if bundle.trade_slicing_signal is not None:
+            weight = self._weights.get("trade_slicing", 0.0)
+            score += bundle.trade_slicing_signal.confidence * weight
+            signals_triggered += 1
+
+        if bundle.order_to_trade_ratio_signal is not None:
+            weight = self._weights.get("order_to_trade_ratio", 0.0)
+            score += bundle.order_to_trade_ratio_signal.confidence * weight
+            signals_triggered += 1
+
+        if bundle.rapid_cancel_signal is not None:
+            weight = self._weights.get("rapid_cancel", 0.0)
+            score += bundle.rapid_cancel_signal.confidence * weight
+            signals_triggered += 1
+
+        if bundle.book_impact_without_fill_signal is not None:
+            weight = self._weights.get("book_impact_without_fill", 0.0)
+            score += bundle.book_impact_without_fill_signal.confidence * weight
+            signals_triggered += 1
+
+        if bundle.model_score_signal is not None:
+            weight = self._weights.get("model_score", 0.0)
+            score += bundle.model_score_signal.confidence * weight
+            signals_triggered += 1
 
         # Apply multi-signal bonus
         if signals_triggered >= 3:

@@ -28,8 +28,9 @@ The Polymarket Insider Tracker monitors prediction market trading activity in re
 |--------|-----------------|----------------|
 | **Fresh Wallets** | Brand new wallets making large trades | Insiders create new wallets to hide their identity |
 | **Unusual Sizing** | Trades that are disproportionately large for the market | Informed traders bet bigger when they have edge |
-| **Niche Markets** | Activity in low-volume, specific-outcome markets | Easier to have inside information on obscure events |
 | **Funding Chains** | Where wallet funds originated from | Links seemingly separate wallets to the same entity |
+| **Sniper Clusters** | Coordinated early entrants across markets | Coordinated wallets often share an insider source |
+| **Order Behavior** | Rapid cancels and book-moving orders with no fills | Can indicate manipulative intent (spoofing-style) |
 
 When suspicious activity is detected, you receive an instant alert with actionable intelligence.
 
@@ -56,22 +57,29 @@ When suspicious activity is detected, you receive an instant alert with actionab
 ### Detection Algorithms
 
 1. **Fresh Wallet Detection**
-   - Checks wallet transaction history on Polygon
-   - Flags wallets with fewer than 5 lifetime transactions making trades over $1,000
-   - Traces funding source to identify if connected to known entities
+   - Computes wallet state *as-of trade time* (historical block resolution)
+   - Defines wallet age via earliest inbound USDC funding transfer (auditable)
+   - Produces a deterministic confidence score from snapshot features
 
 2. **Liquidity Impact Analysis**
-   - Calculates trade size relative to market depth
-   - Flags trades consuming more than 2% of visible order book
-   - Weights by market category (niche markets score higher)
+   - Measures trade size relative to rolling 24h notional volume and visible orderbook depth
+   - No category heuristics and no fabricated metadata fallbacks (strict inputs)
 
 3. **Sniper Cluster Detection**
    - Uses DBSCAN clustering to find wallets that consistently enter markets within minutes of creation
    - Identifies coordinated behavior patterns
 
 4. **Event Correlation**
-   - Cross-references trading activity with news feeds
-   - Detects positions opened 1-4 hours before related news breaks
+   - Measures subsequent market movement after the trade over fixed horizons (15m/1h/4h)
+   - Normalizes by recent volatility (no external news dependency)
+
+5. **Funding-Chain Tracing**
+   - Bounded, on-demand USDC transfer indexing and hop-limited tracing
+   - Persists transfers + derived wallet graph relationships
+
+6. **Spoofing-Style Order Signals** (optional)
+   - Ingests CLOB market-channel `price_change`/`book` events and attributes orders via Level-2 API
+   - Flags rapid cancels and book-moving orders canceled quickly with near-zero fill
 
 ---
 
@@ -86,9 +94,9 @@ Action: BUY YES @ $0.075
 Size: $15,000 USDC (8.2% of daily volume)
 
 Risk Signals:
-  [x] Fresh Wallet (fewer than 5 transactions lifetime)
-  [x] Niche Market (less than $50k daily volume)
-  [x] Large Position (more than 2% order book impact)
+  [x] Fresh Wallet (trade-time nonce + first USDC funding)
+  [x] Large Position (volume + book depth impact)
+  [x] Funding Origin (bounded USDC trace)
 
 Funding Trail:
   --> 0xdef...789 (2-year-old wallet, 500+ txns)
@@ -106,7 +114,9 @@ Confidence: HIGH (3/4 signals triggered)
 - Python 3.11+
 - Docker and Docker Compose
 - Polygon RPC endpoint (Alchemy, QuickNode, or self-hosted)
-- Polymarket API key (free at [docs.polymarket.com](https://docs.polymarket.com))
+- Polymarket CLOB access (public market data endpoints)
+- For `scan`: a local embedding model + Postgres `pgvector` extension
+- For order lifecycle ingestion: CLOB Level-2 credentials (optional)
 
 ### Installation
 
@@ -132,7 +142,10 @@ pip install -e .
 alembic upgrade head
 
 # Run the tracker
-python -m src.main
+python -m polymarket_insider_tracker run
+
+# Historical scan (natural-language query only)
+python -m polymarket_insider_tracker scan --query "US election swing states"
 ```
 
 ### Docker Services
@@ -160,6 +173,7 @@ docker compose logs -f
 docker compose down
 
 # Stop and remove volumes (reset data)
+# Note: required if you change POSTGRES_* credentials after first boot
 docker compose down -v
 ```
 
@@ -168,17 +182,21 @@ docker compose down -v
 ```bash
 # .env file
 POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
-POLYMARKET_API_KEY=your_polymarket_api_key
+POLYMARKET_TRADE_WS_URL=wss://ws-live-data.polymarket.com
+POLYMARKET_CLOB_MARKET_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/market
+POLYMARKET_CLOB_HOST=https://clob.polymarket.com
+
+# Database (async SQLAlchemy)
+DATABASE_URL=postgresql+asyncpg://tracker:dev_password@localhost:5432/polymarket_tracker
 
 # Alert destinations (optional)
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 
-# Detection thresholds
-MIN_TRADE_SIZE_USDC=1000
-FRESH_WALLET_MAX_NONCE=5
-LIQUIDITY_IMPACT_THRESHOLD=0.02
+# Historical scan/backtest (semantic retrieval)
+SCAN_EMBEDDING_MODEL=/path/to/local/embedding/model
+SCAN_EMBEDDING_DIM=384
 ```
 
 ---
@@ -207,8 +225,6 @@ polymarket-insider-tracker/
 │       ├── models.py       # SQLAlchemy models
 │       └── repos.py        # Repository pattern
 ├── tests/                  # Test suite
-├── scripts/
-│   └── backtest.py         # Historical analysis
 ├── docker-compose.yml
 ├── pyproject.toml
 └── README.md
@@ -220,16 +236,15 @@ polymarket-insider-tracker/
 
 ### Phase 1: Core Detection (Current)
 - [x] Project structure and documentation
-- [ ] Polymarket CLOB API integration
-- [ ] Fresh wallet detection
-- [ ] Size anomaly detection
-- [ ] Basic alerting (Discord/Telegram)
+- [x] Polymarket CLOB API integration
+- [x] Fresh wallet detection (trade-time snapshots)
+- [x] Size anomaly detection (volume + depth)
+- [x] Basic alerting (Discord/Telegram)
 
 ### Phase 2: Advanced Intelligence
-- [ ] Funding chain analysis
-- [ ] Sniper cluster detection (DBSCAN)
-- [ ] Market categorization (niche vs mainstream)
-- [ ] Historical backtesting framework
+- [x] Funding chain analysis (bounded USDC tracing)
+- [x] Sniper cluster detection (DBSCAN) + co-entry correlation
+- [x] Historical scan/backtest (`scan --query "..."`)
 
 ### Phase 3: Production Hardening
 - [ ] High-availability deployment

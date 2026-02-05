@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import logging.config
 import sys
+from pathlib import Path
 from typing import NoReturn
 
 from pydantic import ValidationError
@@ -46,9 +48,10 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m polymarket_insider_tracker           Run full pipeline
+  python -m polymarket_insider_tracker run       Run live pipeline
+  python -m polymarket_insider_tracker scan --query "Fed rate cut"
   python -m polymarket_insider_tracker --config-check  Validate config and exit
-  python -m polymarket_insider_tracker --dry-run       Run without sending alerts
+  python -m polymarket_insider_tracker run --dry-run   Run without sending alerts
   python -m polymarket_insider_tracker --log-level DEBUG  Enable debug logging
         """,
     )
@@ -84,6 +87,28 @@ Examples:
         default=None,
         help="Override health check port (default: from settings)",
     )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    run_parser = subparsers.add_parser("run", help="Run the live pipeline (default)")
+    run_parser.set_defaults(command="run")
+
+    scan_parser = subparsers.add_parser("scan", help="Historical scan/backtest (semantic query)")
+    scan_parser.add_argument(
+        "--query",
+        required=True,
+        help="Natural-language query (required)",
+    )
+    scan_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional output JSONL path (default: artifacts/scan_<run_id>.jsonl)",
+    )
+    scan_parser.set_defaults(command="scan")
+
+    train_parser = subparsers.add_parser("train-model", help="Train a self-supervised model")
+    train_parser.set_defaults(command="train-model")
 
     return parser
 
@@ -125,6 +150,9 @@ def configure_logging(level: str) -> None:
         "loggers": {
             "httpx": {"level": "WARNING"},
             "httpcore": {"level": "WARNING"},
+            # HTTP/2 framing/header compression debug (extremely noisy)
+            "h2": {"level": "WARNING"},
+            "hpack": {"level": "WARNING"},
             "websockets": {"level": "WARNING"},
             "web3": {"level": "WARNING"},
             "urllib3": {"level": "WARNING"},
@@ -270,10 +298,17 @@ def main(argv: list[str] | None = None) -> NoReturn:
     """
     parser = create_parser()
     args = parser.parse_args(argv)
+    command = args.command or "run"
 
     # Validate configuration first
     settings = validate_config()
     if settings is None:
+        sys.exit(EXIT_CONFIG_ERROR)
+
+    try:
+        settings.validate_requirements(command=command)  # type: ignore[arg-type]
+    except Exception as e:
+        print(f"Configuration requirements failed: {e}", file=sys.stderr)
         sys.exit(EXIT_CONFIG_ERROR)
 
     # Determine effective log level
@@ -293,9 +328,25 @@ def main(argv: list[str] | None = None) -> NoReturn:
     # Print config summary
     print_config_summary(settings, dry_run)
 
-    # Run pipeline
-    exit_code = asyncio.run(run_pipeline(settings, dry_run))
-    sys.exit(exit_code)
+    if command == "run":
+        exit_code = asyncio.run(run_pipeline(settings, dry_run))
+        sys.exit(exit_code)
+
+    if command == "scan":
+        from polymarket_insider_tracker.scan.runner import run_scan
+
+        result = asyncio.run(run_scan(settings=settings, query=str(args.query), output_path=args.output))
+        print(json.dumps({"run_id": result.run_id, "output_path": str(result.output_path)}))
+        sys.exit(EXIT_SUCCESS)
+
+    if command == "train-model":
+        from polymarket_insider_tracker.training.runner import train_model
+
+        asyncio.run(train_model(settings=settings))
+        sys.exit(EXIT_SUCCESS)
+
+    print(f"Unknown command: {command}", file=sys.stderr)
+    sys.exit(EXIT_ERROR)
 
 
 if __name__ == "__main__":

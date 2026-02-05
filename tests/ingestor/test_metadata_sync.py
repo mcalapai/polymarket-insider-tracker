@@ -21,7 +21,6 @@ from polymarket_insider_tracker.ingestor.models import (
     Market,
     MarketMetadata,
     Token,
-    derive_category,
 )
 
 
@@ -72,63 +71,6 @@ def mock_clob(sample_market: Market) -> MagicMock:
     return clob
 
 
-class TestDeriveCategory:
-    """Tests for the derive_category function."""
-
-    def test_politics_keywords(self) -> None:
-        """Test political category detection."""
-        assert derive_category("Will Trump win the 2024 election?") == "politics"
-        assert derive_category("Who will be the next president?") == "politics"
-        assert derive_category("Senate majority party after midterms?") == "politics"
-
-    def test_crypto_keywords(self) -> None:
-        """Test crypto category detection."""
-        assert derive_category("Will Bitcoin hit $100k?") == "crypto"
-        assert derive_category("Ethereum price by end of year?") == "crypto"
-        assert derive_category("Next altcoin to moon?") == "crypto"
-
-    def test_sports_keywords(self) -> None:
-        """Test sports category detection."""
-        assert derive_category("Who will win the Super Bowl?") == "sports"
-        assert derive_category("NBA Finals champion?") == "sports"
-        assert derive_category("Next UFC heavyweight champion?") == "sports"
-
-    def test_entertainment_keywords(self) -> None:
-        """Test entertainment category detection."""
-        assert derive_category("Best Picture Oscar winner?") == "entertainment"
-        assert derive_category("Next Grammy Album of the Year?") == "entertainment"
-        assert derive_category("Highest box office movie this summer?") == "entertainment"
-
-    def test_finance_keywords(self) -> None:
-        """Test finance category detection."""
-        assert derive_category("Fed interest rate decision?") == "finance"
-        assert derive_category("Will we enter a recession?") == "finance"
-        assert derive_category("S&P 500 by year end?") == "finance"
-
-    def test_tech_keywords(self) -> None:
-        """Test tech category detection."""
-        assert derive_category("Will Apple release a new iPhone?") == "tech"
-        assert derive_category("Next major AI breakthrough?") == "tech"
-        assert derive_category("Tesla vehicle deliveries?") == "tech"
-
-    def test_science_keywords(self) -> None:
-        """Test science category detection."""
-        assert derive_category("NASA Mars mission timeline?") == "science"
-        assert derive_category("FDA approval for new drug?") == "science"
-        assert derive_category("Climate change targets met?") == "science"
-
-    def test_other_category(self) -> None:
-        """Test fallback to 'other' category."""
-        assert derive_category("Random obscure question?") == "other"
-        assert derive_category("Will it be sunny tomorrow?") == "other"
-
-    def test_case_insensitive(self) -> None:
-        """Test case insensitivity."""
-        assert derive_category("BITCOIN PRICE") == "crypto"
-        assert derive_category("bitcoin price") == "crypto"
-        assert derive_category("Bitcoin Price") == "crypto"
-
-
 class TestMarketMetadata:
     """Tests for the MarketMetadata dataclass."""
 
@@ -143,7 +85,6 @@ class TestMarketMetadata:
         assert metadata.end_date == sample_market.end_date
         assert metadata.active == sample_market.active
         assert metadata.closed == sample_market.closed
-        assert metadata.category == "crypto"  # "Bitcoin" in question
         assert metadata.last_updated is not None
 
     def test_to_dict(self, sample_metadata: MarketMetadata) -> None:
@@ -152,7 +93,6 @@ class TestMarketMetadata:
 
         assert data["condition_id"] == sample_metadata.condition_id
         assert data["question"] == sample_metadata.question
-        assert data["category"] == "crypto"
         assert len(data["tokens"]) == 1
         assert data["tokens"][0]["token_id"] == "token123"
 
@@ -163,7 +103,6 @@ class TestMarketMetadata:
 
         assert restored.condition_id == sample_metadata.condition_id
         assert restored.question == sample_metadata.question
-        assert restored.category == sample_metadata.category
         assert len(restored.tokens) == 1
 
     def test_roundtrip(self, sample_metadata: MarketMetadata) -> None:
@@ -398,28 +337,6 @@ class TestMarketMetadataSync:
         assert sync_stats[0].markets_cached == 1
 
         await sync.stop()
-
-    @pytest.mark.asyncio
-    async def test_get_markets_by_category(
-        self, mock_redis: AsyncMock, mock_clob: MagicMock, sample_metadata: MarketMetadata
-    ) -> None:
-        """Test getting markets by category."""
-        # Setup scan to return keys
-        key = f"{DEFAULT_REDIS_KEY_PREFIX}cond123"
-        mock_redis.scan = AsyncMock(return_value=(0, [key]))
-
-        # Setup get to return cached data
-        cached_data = json.dumps(sample_metadata.to_dict())
-        mock_redis.get = AsyncMock(return_value=cached_data)
-
-        sync = MarketMetadataSync(redis=mock_redis, clob_client=mock_clob)
-        # Don't start to avoid initial sync complexity
-        sync._state = SyncState.IDLE
-
-        results = await sync.get_markets_by_category("crypto")
-
-        assert len(results) == 1
-        assert results[0].category == "crypto"
 
     @pytest.mark.asyncio
     async def test_cannot_start_twice(self, mock_redis: AsyncMock, mock_clob: MagicMock) -> None:

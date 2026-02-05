@@ -2,16 +2,15 @@
 
 import asyncio
 import logging
-import os
 import time
 from collections.abc import Callable
 from functools import wraps
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
 from py_clob_client.client import ClobClient as BaseClobClient
-from py_clob_client.clob_types import BookParams
+from py_clob_client.clob_types import ApiCreds, BookParams, TradeParams
 
-from polymarket_insider_tracker.ingestor.models import Market, Orderbook
+from polymarket_insider_tracker.ingestor.models import Market, Orderbook, TradeEvent
 
 logger = logging.getLogger(__name__)
 
@@ -137,33 +136,60 @@ class ClobClient:
 
     def __init__(
         self,
-        api_key: str | None = None,
+        *,
         host: str = DEFAULT_HOST,
+        chain_id: int = 137,
+        private_key: str | None = None,
+        api_creds: ApiCreds | None = None,
+        signature_type: int | None = None,
+        funder: str | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         requests_per_second: float = MAX_REQUESTS_PER_SECOND,
     ) -> None:
         """Initialize the CLOB client.
 
         Args:
-            api_key: Polymarket API key. If not provided, reads from
-                POLYMARKET_API_KEY environment variable.
             host: CLOB API endpoint URL.
+            chain_id: Chain ID for signing (Polygon=137).
+            private_key: Private key used for L2 authentication.
+            api_creds: CLOB API credentials (key/secret/passphrase) for L2 endpoints.
+            signature_type: Optional signature type override.
+            funder: Optional funder override.
             max_retries: Maximum retry attempts for failed requests.
             requests_per_second: Rate limit for API requests.
         """
-        self._api_key = api_key or os.environ.get("POLYMARKET_API_KEY")
         self._host = host
+        self._chain_id = chain_id
+        self._private_key = private_key
+        self._api_creds = api_creds
+        self._signature_type = signature_type
+        self._funder = funder
         self._max_retries = max_retries
         self._rate_limiter = RateLimiter(requests_per_second)
 
-        # Initialize the underlying client (read-only, no auth needed for queries)
-        self._client = BaseClobClient(host)
+        # Initialize the underlying client (can be Level 0/1/2).
+        self._client = BaseClobClient(
+            host,
+            chain_id=chain_id,
+            key=private_key,
+            creds=api_creds,
+            signature_type=signature_type,
+            funder=funder,
+        )
 
         logger.info(
             "Initialized ClobClient with host=%s, rate_limit=%.1f req/s",
             host,
             requests_per_second,
         )
+
+    @property
+    def is_level2_configured(self) -> bool:
+        return self._private_key is not None and self._api_creds is not None
+
+    def _require_level2(self) -> None:
+        if not self.is_level2_configured:
+            raise ClobClientError("Level-2 auth is required for this endpoint")
 
     def _with_rate_limit(self, func: Callable[P, T]) -> Callable[P, T]:
         """Wrap a function with rate limiting."""
@@ -252,6 +278,51 @@ class ClobClient:
             return Orderbook.from_clob_orderbook(orderbook)
         except Exception as e:
             raise ClobClientError(f"Failed to fetch orderbook for {token_id}: {e}") from e
+
+    @with_retry()
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        """Fetch an order by its hash (requires L2 auth)."""
+        self._require_level2()
+        self._rate_limiter.acquire_sync()
+        try:
+            return self._client.get_order(order_id)
+        except Exception as e:
+            raise ClobClientError(f"Failed to fetch order {order_id}: {e}") from e
+
+    @with_retry()
+    def get_trades(self, params: TradeParams | None = None) -> list[dict[str, Any]]:
+        """Fetch trades via the Level-2 trades endpoint (requires L2 auth)."""
+        self._require_level2()
+        self._rate_limiter.acquire_sync()
+        try:
+            return self._client.get_trades(params=params)
+        except Exception as e:
+            raise ClobClientError(f"Failed to fetch trades: {e}") from e
+
+    @with_retry()
+    def get_market_trades(self, condition_id: str) -> list[TradeEvent]:
+        """Fetch historical trade events for a market (public endpoint)."""
+        self._rate_limiter.acquire_sync()
+        try:
+            resp = self._client.get_market_trades_events(condition_id)
+        except Exception as e:
+            raise ClobClientError(f"Failed to fetch market trades for {condition_id}: {e}") from e
+
+        items: Any = resp
+        if isinstance(resp, dict) and isinstance(resp.get("data"), list):
+            items = resp["data"]
+        if not isinstance(items, list):
+            raise ClobClientError("Unexpected market trades response shape")
+
+        out: list[TradeEvent] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            trade = TradeEvent.from_websocket_message(raw)
+            if not (trade.trade_id and trade.market_id and trade.wallet_address):
+                raise ClobClientError("Market trades response is missing required trade identifiers")
+            out.append(trade)
+        return out
 
     @with_retry()
     def get_orderbooks(self, token_ids: list[str]) -> list[Orderbook]:
