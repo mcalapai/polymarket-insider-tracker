@@ -179,6 +179,7 @@ async def run_scan(
             )
         clob = ClobClient(
             host=settings.polymarket.clob_host,
+            data_api_host=settings.polymarket.data_api_host,
             chain_id=settings.polymarket.clob_chain_id,
             private_key=private_key,
             api_creds=api_creds,
@@ -258,7 +259,11 @@ async def run_scan(
 
             for m in markets:
                 try:
-                    raw_trades = await asyncio.to_thread(clob.get_market_trades, m.condition_id)
+                    raw_trades = await asyncio.to_thread(
+                        clob.get_market_trades,
+                        m.condition_id,
+                        max_trades=settings.scan.max_trades_per_market,
+                    )
                 except ClobClientNotFoundError as e:
                     skipped_markets += 1
                     logger.warning("Skipping market with no trades endpoint (market=%s): %s", m.condition_id, e)

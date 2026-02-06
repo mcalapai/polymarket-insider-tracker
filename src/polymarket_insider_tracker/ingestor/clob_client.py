@@ -7,10 +7,12 @@ from collections.abc import Iterator
 from collections.abc import Callable
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
+from urllib.parse import urlencode
 
 from py_clob_client.client import ClobClient as BaseClobClient
 from py_clob_client.clob_types import ApiCreds, BookParams, TradeParams
 from py_clob_client.exceptions import PolyApiException
+from py_clob_client.http_helpers.helpers import get as http_get
 
 from polymarket_insider_tracker.ingestor.models import Market, Orderbook, TradeEvent
 
@@ -21,6 +23,7 @@ T = TypeVar("T")
 
 # Constants
 DEFAULT_HOST = "https://clob.polymarket.com"
+DEFAULT_DATA_API_HOST = "https://data-api.polymarket.com"
 MAX_REQUESTS_PER_SECOND = 10
 MIN_REQUEST_INTERVAL = 1.0 / MAX_REQUESTS_PER_SECOND  # 0.1 seconds
 
@@ -148,6 +151,7 @@ class ClobClient:
         self,
         *,
         host: str = DEFAULT_HOST,
+        data_api_host: str = DEFAULT_DATA_API_HOST,
         chain_id: int = 137,
         private_key: str | None = None,
         api_creds: ApiCreds | None = None,
@@ -160,6 +164,7 @@ class ClobClient:
 
         Args:
             host: CLOB API endpoint URL.
+            data_api_host: Polymarket Data API endpoint URL.
             chain_id: Chain ID for signing (Polygon=137).
             private_key: Private key used for L2 authentication.
             api_creds: CLOB API credentials (key/secret/passphrase) for L2 endpoints.
@@ -169,6 +174,7 @@ class ClobClient:
             requests_per_second: Rate limit for API requests.
         """
         self._host = host
+        self._data_api_host = data_api_host.rstrip("/")
         self._chain_id = chain_id
         self._private_key = private_key
         self._api_creds = api_creds
@@ -188,8 +194,9 @@ class ClobClient:
         )
 
         logger.info(
-            "Initialized ClobClient with host=%s, rate_limit=%.1f req/s",
+            "Initialized ClobClient with host=%s data_api_host=%s rate_limit=%.1f req/s",
             host,
+            self._data_api_host,
             requests_per_second,
         )
 
@@ -343,6 +350,99 @@ class ClobClient:
             raise ClobClientError(f"{source} returned trades but none had required identifiers")
         return out
 
+    @with_retry(retry_on=(ClobClientTransientError,))
+    def _get_data_api_trades_page(
+        self,
+        *,
+        condition_id: str,
+        limit: int,
+        next_cursor: str | None,
+    ) -> dict[str, Any] | list[Any]:
+        """Fetch one page of market trades from the Polymarket Data API."""
+        self._rate_limiter.acquire_sync()
+        params: dict[str, str] = {
+            "market": condition_id,
+            "limit": str(limit),
+        }
+        if next_cursor:
+            params["next_cursor"] = next_cursor
+        url = f"{self._data_api_host}/trades?{urlencode(params)}"
+        try:
+            resp = http_get(url)
+        except PolyApiException as e:
+            status = getattr(e, "status_code", None)
+            if status == 404:
+                raise ClobClientNotFoundError(
+                    f"Data API trades endpoint returned 404 for {condition_id}"
+                ) from e
+            if status in RETRY_STATUS_CODES or status is None:
+                raise ClobClientTransientError(
+                    f"Failed to fetch data-api trades for {condition_id}: {e}"
+                ) from e
+            raise ClobClientError(f"Failed to fetch data-api trades for {condition_id}: {e}") from e
+        except Exception as e:
+            raise ClobClientTransientError(
+                f"Failed to fetch data-api trades for {condition_id}: {e}"
+            ) from e
+        if not isinstance(resp, (dict, list)):
+            raise ClobClientError("Unexpected data-api trades response shape")
+        return resp
+
+    def _extract_page(
+        self,
+        *,
+        resp: dict[str, Any] | list[Any],
+        source: str,
+    ) -> tuple[list[Any], str | None]:
+        """Extract page items and next_cursor from a paginated response."""
+        if isinstance(resp, list):
+            return resp, None
+        items_any = resp.get("data")
+        if not isinstance(items_any, list):
+            if isinstance(resp.get("trades"), list):
+                items_any = resp["trades"]
+            elif isinstance(resp.get("results"), list):
+                items_any = resp["results"]
+            else:
+                raise ClobClientError(f"Unexpected {source} page shape")
+        next_cursor = resp.get("next_cursor") or resp.get("nextCursor") or resp.get("cursor")
+        if next_cursor is not None:
+            next_cursor = str(next_cursor)
+        return items_any, next_cursor
+
+    def _get_market_trades_data_api(
+        self,
+        *,
+        condition_id: str,
+        max_trades: int,
+    ) -> list[TradeEvent]:
+        """Fetch market-level historical trades from Data API with bounded pagination."""
+        if max_trades < 1:
+            raise ValueError("max_trades must be >= 1")
+        next_cursor: str | None = None
+        out: list[TradeEvent] = []
+        page_size = min(max_trades, 500)
+
+        while len(out) < max_trades:
+            resp = self._get_data_api_trades_page(
+                condition_id=condition_id,
+                limit=page_size,
+                next_cursor=next_cursor,
+            )
+            page_items, page_cursor = self._extract_page(resp=resp, source="data-api/trades")
+            page_trades = self._normalize_trade_events(resp=page_items, source="data-api/trades")
+            if page_trades:
+                out.extend(page_trades)
+            if not page_items:
+                break
+            if not page_cursor or page_cursor == "LTE=" or page_cursor == next_cursor:
+                break
+            next_cursor = page_cursor
+
+        if not out:
+            raise ClobClientNotFoundError(f"No trades available from Data API for {condition_id}")
+        return out[:max_trades]
+
     def _get_market_trades_events(self, condition_id: str) -> list[TradeEvent]:
         """Fetch historical trades from public market events endpoint."""
         self._rate_limiter.acquire_sync()
@@ -363,50 +463,30 @@ class ClobClient:
             raise ClobClientTransientError(f"Failed to fetch market trades for {condition_id}: {e}") from e
         return self._normalize_trade_events(resp=resp, source="live-activity/events")
 
-    def _get_market_trades_l2(self, condition_id: str) -> list[TradeEvent]:
-        """Fetch historical trades from Level-2 authenticated trades endpoint."""
-        self._require_level2()
-        self._rate_limiter.acquire_sync()
-        params = TradeParams(market=condition_id)
-        try:
-            resp = self._client.get_trades(params=params)
-        except PolyApiException as e:
-            status = getattr(e, "status_code", None)
-            if status == 404:
-                raise ClobClientNotFoundError(f"Level-2 trades endpoint returned 404 for {condition_id}") from e
-            if status in RETRY_STATUS_CODES:
-                raise ClobClientTransientError(
-                    f"Failed to fetch Level-2 market trades for {condition_id}: {e}"
-                ) from e
-            raise ClobClientError(f"Failed to fetch Level-2 market trades for {condition_id}: {e}") from e
-        except Exception as e:
-            raise ClobClientTransientError(
-                f"Failed to fetch Level-2 market trades for {condition_id}: {e}"
-            ) from e
-        return self._normalize_trade_events(resp=resp, source="data/trades")
-
     @with_retry(retry_on=(ClobClientTransientError,))
-    def get_market_trades(self, condition_id: str) -> list[TradeEvent]:
+    def get_market_trades(self, condition_id: str, *, max_trades: int = 50_000) -> list[TradeEvent]:
         """Fetch historical market trades via deterministic source selection.
 
         Strategy:
-        1) If Level-2 auth is configured, use `/data/trades?market=...` (full history).
+        1) Use Data API `/trades?market=...` for market-level historical trades.
         2) Fall back to public `/live-activity/events/{condition_id}` when needed.
         """
         attempted: list[str] = []
         terminal_error: ClobClientError | None = None
 
-        if self.is_level2_configured:
-            try:
-                l2_trades = self._get_market_trades_l2(condition_id)
-                if l2_trades:
-                    return l2_trades
-                attempted.append("data/trades:empty")
-            except ClobClientNotFoundError:
-                attempted.append("data/trades:404")
-            except ClobClientError as e:
-                attempted.append("data/trades:error")
-                terminal_error = e
+        try:
+            data_api_trades = self._get_market_trades_data_api(
+                condition_id=condition_id,
+                max_trades=max_trades,
+            )
+            if data_api_trades:
+                return data_api_trades
+            attempted.append("data-api/trades:empty")
+        except ClobClientNotFoundError:
+            attempted.append("data-api/trades:404_or_empty")
+        except ClobClientError as e:
+            attempted.append("data-api/trades:error")
+            terminal_error = e
 
         try:
             events_trades = self._get_market_trades_events(condition_id)

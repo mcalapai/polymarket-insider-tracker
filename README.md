@@ -185,6 +185,7 @@ POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
 POLYMARKET_TRADE_WS_URL=wss://ws-live-data.polymarket.com
 POLYMARKET_CLOB_MARKET_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/market
 POLYMARKET_CLOB_HOST=https://clob.polymarket.com
+POLYMARKET_DATA_API_HOST=https://data-api.polymarket.com
 
 # Database (async SQLAlchemy)
 DATABASE_URL=postgresql+asyncpg://tracker:dev_password@localhost:${POSTGRES_PORT:-5432}/polymarket_tracker

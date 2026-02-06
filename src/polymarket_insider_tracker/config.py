@@ -106,6 +106,11 @@ class PolymarketSettings(BaseSettings):
         alias="POLYMARKET_CLOB_HOST",
         description="CLOB HTTP API host",
     )
+    data_api_host: str = Field(
+        default="https://data-api.polymarket.com",
+        alias="POLYMARKET_DATA_API_HOST",
+        description="Polymarket Data API host (historical market trades)",
+    )
     clob_chain_id: int = Field(
         default=137,
         alias="POLYMARKET_CLOB_CHAIN_ID",
@@ -114,7 +119,7 @@ class PolymarketSettings(BaseSettings):
     clob_private_key: SecretStr | None = Field(
         default=None,
         alias="POLYMARKET_CLOB_PRIVATE_KEY",
-        description="Private key used for L2 authentication (required for order/trade history endpoints)",
+        description="Private key used for L2 authentication (required for order attribution/user-trade endpoints)",
     )
     clob_api_key: SecretStr | None = Field(
         default=None,
@@ -150,11 +155,11 @@ class PolymarketSettings(BaseSettings):
             raise ValueError("WebSocket URL must start with ws:// or wss://")
         return v
 
-    @field_validator("clob_host")
+    @field_validator("clob_host", "data_api_host")
     @classmethod
-    def validate_clob_host(cls, v: str) -> str:
+    def validate_http_host(cls, v: str) -> str:
         if not v.startswith(("http://", "https://")):
-            raise ValueError("POLYMARKET_CLOB_HOST must be an HTTP(S) endpoint")
+            raise ValueError("Polymarket host must be an HTTP(S) endpoint")
         return v.rstrip("/")
 
 
@@ -892,8 +897,8 @@ class Settings(BaseSettings):
             if not self.scan.embedding_dim:
                 raise ValueError("SCAN_EMBEDDING_DIM is required for historical scan/training")
 
-        # L2 auth is required for order attribution and full historical scan trade fetches.
-        needs_level2 = command == "scan" or (command == "run" and self.orders.enabled)
+        # L2 auth is required for order attribution endpoints.
+        needs_level2 = command == "run" and self.orders.enabled
 
         if needs_level2:
             if not self.polymarket.clob_private_key:

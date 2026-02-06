@@ -399,6 +399,7 @@ class Pipeline:
             )
         self._clob_client = ClobClient(
             host=settings.polymarket.clob_host,
+            data_api_host=settings.polymarket.data_api_host,
             chain_id=settings.polymarket.clob_chain_id,
             private_key=private_key,
             api_creds=api_creds,

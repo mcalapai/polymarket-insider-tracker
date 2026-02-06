@@ -1,6 +1,8 @@
 """Tests for ClobClient wrapper."""
 
 import time
+from datetime import UTC, datetime
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,7 +14,7 @@ from polymarket_insider_tracker.ingestor.clob_client import (
     RetryError,
     with_retry,
 )
-from polymarket_insider_tracker.ingestor.models import Market, Orderbook
+from polymarket_insider_tracker.ingestor.models import Market, Orderbook, TradeEvent
 from py_clob_client.clob_types import ApiCreds
 
 
@@ -137,37 +139,32 @@ class TestClobClient:
         )
         assert client2.is_level2_configured is True
 
-    def test_get_market_trades_prefers_level2(self, mock_base_client: MagicMock) -> None:
-        """Market trade fetch should use L2 trades endpoint when configured."""
-        mock_base_client.get_trades.return_value = [
-            {
-                "id": "trade_1",
-                "market": "0xabc",
-                "maker_address": "0xmaker",
-                "asset_id": "asset_1",
-                "side": "BUY",
-                "price": "0.42",
-                "size": "100",
-                "timestamp": 1704067200,
-            }
-        ]
-
-        client = ClobClient(
-            private_key="0x" + "1" * 64,
-            api_creds=ApiCreds(api_key="k", api_secret="s", api_passphrase="p"),
+    def test_get_market_trades_prefers_data_api(self, mock_base_client: MagicMock) -> None:
+        """Market trade fetch should use Data API as primary source."""
+        client = ClobClient()
+        expected = TradeEvent(
+            market_id="0xabc",
+            trade_id="trade_1",
+            wallet_address="0xmaker",
+            side="BUY",
+            outcome="Yes",
+            outcome_index=0,
+            price=Decimal("0.42"),
+            size=Decimal("100"),
+            timestamp=datetime.now(UTC),
+            asset_id="asset_1",
         )
-        trades = client.get_market_trades("0xabc")
+        with patch.object(client, "_get_market_trades_data_api", return_value=[expected]) as data_api:
+            with patch.object(client, "_get_market_trades_events") as events:
+                trades = client.get_market_trades("0xabc")
 
         assert len(trades) == 1
-        assert trades[0].market_id == "0xabc"
         assert trades[0].trade_id == "trade_1"
-        assert trades[0].wallet_address == "0xmaker"
-        assert mock_base_client.get_trades.call_count == 1
-        assert mock_base_client.get_market_trades_events.call_count == 0
+        data_api.assert_called_once()
+        events.assert_not_called()
 
     def test_get_market_trades_falls_back_to_events(self, mock_base_client: MagicMock) -> None:
-        """If L2 returns no trades, fallback to public events endpoint."""
-        mock_base_client.get_trades.return_value = []
+        """If Data API has no data, fallback to public events endpoint."""
         mock_base_client.get_market_trades_events.return_value = [
             {
                 "transactionHash": "0xtradehash",
@@ -181,31 +178,34 @@ class TestClobClient:
             }
         ]
 
-        client = ClobClient(
-            private_key="0x" + "1" * 64,
-            api_creds=ApiCreds(api_key="k", api_secret="s", api_passphrase="p"),
-        )
-        trades = client.get_market_trades("0xabc")
+        client = ClobClient()
+        with patch.object(
+            client,
+            "_get_market_trades_data_api",
+            side_effect=ClobClientNotFoundError("no data"),
+        ) as data_api:
+            trades = client.get_market_trades("0xabc")
 
         assert len(trades) == 1
         assert trades[0].trade_id == "0xtradehash"
-        assert mock_base_client.get_trades.call_count == 1
+        data_api.assert_called_once()
         assert mock_base_client.get_market_trades_events.call_count == 1
 
     def test_get_market_trades_raises_not_found_when_no_sources_have_data(
         self, mock_base_client: MagicMock
     ) -> None:
         """No data from either source should raise ClobClientNotFoundError."""
-        mock_base_client.get_trades.return_value = []
         mock_base_client.get_market_trades_events.return_value = []
 
-        client = ClobClient(
-            private_key="0x" + "1" * 64,
-            api_creds=ApiCreds(api_key="k", api_secret="s", api_passphrase="p"),
-        )
+        client = ClobClient()
+        with patch.object(
+            client,
+            "_get_market_trades_data_api",
+            side_effect=ClobClientNotFoundError("no data"),
+        ):
+            with pytest.raises(ClobClientNotFoundError, match="No trades available"):
+                client.get_market_trades("0xabc")
 
-        with pytest.raises(ClobClientNotFoundError, match="No trades available"):
-            client.get_market_trades("0xabc")
 
     def test_health_check_success(self, mock_base_client: MagicMock) -> None:
         """Test health check returns True when API responds OK."""
