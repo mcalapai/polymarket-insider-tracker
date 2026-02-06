@@ -198,6 +198,20 @@ TELEGRAM_CHAT_ID=your_chat_id
 # Historical scan/backtest (semantic retrieval)
 SCAN_EMBEDDING_MODEL=/path/to/local/embedding/model
 SCAN_EMBEDDING_DIM=384
+SCAN_HISTORICAL_LIQUIDITY_POLICY=skip_size_signal
+
+# Historical liquidity collector + quality gates
+LIQUIDITY_SNAPSHOT_CADENCE_SECONDS=300
+LIQUIDITY_MARKET_MIN_COVERAGE_RATIO=0.80
+LIQUIDITY_RUN_MIN_COVERAGE_RATIO=0.90
+```
+
+Coverage backfill from already-collected snapshots (forward-only, no synthetic reconstruction):
+
+```bash
+python -m polymarket_insider_tracker liquidity-coverage-backfill \
+  --start 2026-01-01T00:00:00+00:00 \
+  --end 2026-02-01T00:00:00+00:00
 ```
 
 ---

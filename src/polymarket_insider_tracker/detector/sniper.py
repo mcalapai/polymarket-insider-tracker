@@ -165,7 +165,7 @@ class SniperDetector:
             avg_delta = self._avg_entry_delta(wallet_entries, wallets)
             confidence = self._calculate_confidence(
                 wallets,
-                avg_delta_seconds=avg_delta,
+                avg_entry_delta_seconds=avg_delta,
                 markets_in_common=markets_in_common,
             )
             cluster_id = self._deterministic_cluster_id(wallets)

@@ -20,6 +20,8 @@ from polymarket_insider_tracker.ingestor.metadata_sync import (
 from polymarket_insider_tracker.ingestor.models import (
     Market,
     MarketMetadata,
+    Orderbook,
+    OrderbookLevel,
     Token,
 )
 
@@ -59,6 +61,9 @@ def mock_redis() -> AsyncMock:
     redis.setex = AsyncMock()
     redis.delete = AsyncMock(return_value=1)
     redis.scan = AsyncMock(return_value=(0, []))
+    redis.zadd = AsyncMock(return_value=1)
+    redis.zremrangebyscore = AsyncMock(return_value=0)
+    redis.zrangebyscore = AsyncMock(return_value=[])
     return redis
 
 
@@ -183,7 +188,7 @@ class TestMarketMetadataSync:
         await sync.start()
 
         # Should have called get_markets
-        mock_clob.get_markets.assert_called_once_with(True)
+        mock_clob.get_markets.assert_called_once_with(False)
 
         # Should have cached the market
         mock_redis.setex.assert_called()
@@ -358,3 +363,104 @@ class TestMarketMetadataSync:
         await sync.stop()  # Should be a no-op
 
         assert sync.state == SyncState.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_sync_tracks_tradable_market_universe(
+        self, mock_redis: AsyncMock, mock_clob: MagicMock, sample_market: Market
+    ) -> None:
+        non_tradable = Market(
+            condition_id="cond-closed",
+            question="Closed market",
+            description="",
+            tokens=sample_market.tokens,
+            active=True,
+            closed=False,
+            accepting_orders=False,
+            enable_order_book=True,
+        )
+        mock_clob.get_markets.return_value = [sample_market, non_tradable]
+
+        sync = MarketMetadataSync(redis=mock_redis, clob_client=mock_clob)
+        await sync.start()
+        await sync.stop()
+
+        assert sample_market.condition_id in sync._eligible_tradable_market_ids
+        assert non_tradable.condition_id not in sync._eligible_tradable_market_ids
+
+    @pytest.mark.asyncio
+    async def test_liquidity_snapshots_are_bucketed_to_cadence(
+        self, mock_redis: AsyncMock, mock_clob: MagicMock
+    ) -> None:
+        token = Token(token_id="token123", outcome="Yes", price=Decimal("0.50"))
+        market = Market(
+            condition_id="cond123",
+            question="Q",
+            description="D",
+            tokens=(token,),
+            active=True,
+            closed=False,
+            accepting_orders=True,
+            enable_order_book=True,
+        )
+        mock_clob.get_markets.return_value = [market]
+        mock_redis.zrangebyscore.return_value = [b"cond123"]
+        mock_clob.get_orderbook.return_value = Orderbook(
+            market="cond123",
+            asset_id="token123",
+            bids=(OrderbookLevel(price=Decimal("0.49"), size=Decimal("100")),),
+            asks=(OrderbookLevel(price=Decimal("0.51"), size=Decimal("100")),),
+            tick_size=Decimal("0.01"),
+        )
+
+        snapshots = []
+
+        async def on_snapshot(snapshot):  # type: ignore[no-untyped-def]
+            snapshots.append(snapshot)
+
+        sync = MarketMetadataSync(
+            redis=mock_redis,
+            clob_client=mock_clob,
+            snapshot_cadence_seconds=300,
+            on_liquidity_snapshot=on_snapshot,
+        )
+        await sync.start()
+        await sync.stop()
+
+        assert snapshots
+        assert int(snapshots[0].computed_at.timestamp()) % 300 == 0
+
+    @pytest.mark.asyncio
+    async def test_orderbook_request_retries(
+        self, mock_redis: AsyncMock, mock_clob: MagicMock
+    ) -> None:
+        token = Token(token_id="token123", outcome="Yes", price=Decimal("0.50"))
+        market = Market(
+            condition_id="cond123",
+            question="Q",
+            description="D",
+            tokens=(token,),
+            active=True,
+            closed=False,
+            accepting_orders=True,
+            enable_order_book=True,
+        )
+        orderbook = Orderbook(
+            market="cond123",
+            asset_id="token123",
+            bids=(OrderbookLevel(price=Decimal("0.49"), size=Decimal("100")),),
+            asks=(OrderbookLevel(price=Decimal("0.51"), size=Decimal("100")),),
+            tick_size=Decimal("0.01"),
+        )
+        mock_clob.get_markets.return_value = [market]
+        mock_redis.zrangebyscore.return_value = [b"cond123"]
+        mock_clob.get_orderbook.side_effect = [RuntimeError("temporary"), orderbook]
+
+        sync = MarketMetadataSync(
+            redis=mock_redis,
+            clob_client=mock_clob,
+            orderbook_max_retries=1,
+        )
+        await sync.start()
+        await sync.stop()
+
+        assert mock_clob.get_orderbook.call_count == 2

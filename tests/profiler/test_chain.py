@@ -1,11 +1,13 @@
 """Tests for the Polygon blockchain client."""
 
 import asyncio
+import json
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from web3.exceptions import Web3Exception
+from web3.middleware import ExtraDataToPOAMiddleware
 
 from polymarket_insider_tracker.profiler.chain import (
     DEFAULT_CACHE_TTL_SECONDS,
@@ -107,6 +109,27 @@ class TestPolygonClient:
 
         assert client._fallback_rpc_url == "https://fallback.com"
         assert client._w3_fallback is not None
+
+    def test_init_injects_poa_middleware_for_all_rpc_clients(self) -> None:
+        """PoA middleware should be installed for both primary and fallback RPC clients."""
+        primary = MagicMock()
+        primary.middleware_onion = MagicMock()
+        fallback = MagicMock()
+        fallback.middleware_onion = MagicMock()
+
+        with patch(
+            "polymarket_insider_tracker.profiler.chain.AsyncWeb3",
+            side_effect=[primary, fallback],
+        ):
+            client = PolygonClient(
+                "https://polygon-rpc.com",
+                fallback_rpc_url="https://fallback.com",
+            )
+
+        assert client._w3 is primary
+        assert client._w3_fallback is fallback
+        primary.middleware_onion.inject.assert_called_once_with(ExtraDataToPOAMiddleware, layer=0)
+        fallback.middleware_onion.inject.assert_called_once_with(ExtraDataToPOAMiddleware, layer=0)
 
     def test_init_custom_config(self) -> None:
         """Test initialization with custom config."""
@@ -273,6 +296,22 @@ class TestPolygonClient:
             healthy = await client.health_check()
 
             assert healthy is False
+
+    @pytest.mark.asyncio
+    async def test_aclose_disconnects_provider_sessions(self) -> None:
+        """Closing the client should disconnect both primary and fallback providers."""
+        client = PolygonClient(
+            "https://polygon-rpc.com",
+            fallback_rpc_url="https://fallback.com",
+        )
+        client._w3.provider.disconnect = AsyncMock()
+        assert client._w3_fallback is not None
+        client._w3_fallback.provider.disconnect = AsyncMock()
+
+        await client.aclose()
+
+        client._w3.provider.disconnect.assert_called_once_with()
+        client._w3_fallback.provider.disconnect.assert_called_once_with()
 
 
 class TestPolygonClientRetryLogic:
@@ -459,3 +498,24 @@ class TestPolygonClientBlock:
             mock_redis.set.assert_called_once()
             call_args = mock_redis.set.call_args
             assert call_args[1]["ex"] == 3600
+
+    @pytest.mark.asyncio
+    async def test_get_block_uncached_serializes_hexbytes_like_fields(
+        self, mock_redis: AsyncMock
+    ) -> None:
+        """Hex/bytes fields in blocks should not crash cache serialization."""
+        client = PolygonClient("https://polygon-rpc.com", redis=mock_redis)
+
+        with patch.object(client, "_execute_with_retry", new_callable=AsyncMock) as mock_exec:
+            mock_exec.return_value = {
+                "timestamp": 1704369600,
+                "number": 50000000,
+                "hash": b"\x12\x34",
+            }
+
+            block = await client.get_block(50000000)
+
+            assert block["timestamp"] == 1704369600
+            payload = mock_redis.set.call_args[0][1]
+            cached = json.loads(payload)
+            assert cached["hash"] == "0x1234"

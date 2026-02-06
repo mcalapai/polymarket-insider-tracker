@@ -308,6 +308,83 @@ class LiquiditySettings(BaseSettings):
         le=10_000,
         description="Orderbook depth band around mid (bps)",
     )
+    metadata_sync_interval_seconds: int = Field(
+        default=60,
+        alias="LIQUIDITY_METADATA_SYNC_INTERVAL_SECONDS",
+        ge=10,
+        le=3600,
+        description="How often to refresh market metadata and run collection scheduling",
+    )
+    snapshot_cadence_seconds: int = Field(
+        default=300,
+        alias="LIQUIDITY_SNAPSHOT_CADENCE_SECONDS",
+        ge=60,
+        le=3600,
+        description="Target snapshot cadence for durable liquidity collection",
+    )
+    active_sweep_interval_seconds: int = Field(
+        default=300,
+        alias="LIQUIDITY_ACTIVE_SWEEP_INTERVAL_SECONDS",
+        ge=60,
+        le=3600,
+        description="How often to include active tradable-market sweep candidates",
+    )
+    active_sweep_batch_size: int = Field(
+        default=250,
+        alias="LIQUIDITY_ACTIVE_SWEEP_BATCH_SIZE",
+        ge=1,
+        le=10_000,
+        description="Maximum tradable markets to sweep per interval",
+    )
+    request_timeout_seconds: float = Field(
+        default=10.0,
+        alias="LIQUIDITY_REQUEST_TIMEOUT_SECONDS",
+        ge=0.1,
+        le=120.0,
+        description="Per-orderbook request timeout",
+    )
+    request_max_retries: int = Field(
+        default=2,
+        alias="LIQUIDITY_REQUEST_MAX_RETRIES",
+        ge=0,
+        le=10,
+        description="Retry attempts per orderbook request after the initial attempt",
+    )
+    collection_max_concurrency: int = Field(
+        default=10,
+        alias="LIQUIDITY_COLLECTION_MAX_CONCURRENCY",
+        ge=1,
+        le=512,
+        description="Maximum concurrent orderbook fetches in the collector",
+    )
+    coverage_job_interval_seconds: int = Field(
+        default=3600,
+        alias="LIQUIDITY_COVERAGE_JOB_INTERVAL_SECONDS",
+        ge=300,
+        le=86_400,
+        description="How often to compute and persist liquidity coverage metrics",
+    )
+    coverage_window_hours: int = Field(
+        default=24,
+        alias="LIQUIDITY_COVERAGE_WINDOW_HOURS",
+        ge=1,
+        le=24 * 14,
+        description="Coverage window size for periodic collector-side quality metrics",
+    )
+    market_min_coverage_ratio: float = Field(
+        default=0.8,
+        alias="LIQUIDITY_MARKET_MIN_COVERAGE_RATIO",
+        ge=0.0,
+        le=1.0,
+        description="Per market/token minimum coverage ratio to enable liquidity-dependent signals",
+    )
+    run_min_coverage_ratio: float = Field(
+        default=0.9,
+        alias="LIQUIDITY_RUN_MIN_COVERAGE_RATIO",
+        ge=0.0,
+        le=1.0,
+        description="Run-level minimum average coverage ratio for liquidity-aware quality label",
+    )
 
 
 class BaselineSettings(BaseSettings):
@@ -556,10 +633,10 @@ class ScanSettings(BaseSettings):
         le=5_000_000,
         description="Hard cap on trades fetched per market (bounded work)",
     )
-    allow_non_historical_book_depth: bool = Field(
-        default=False,
-        alias="SCAN_ALLOW_NON_HISTORICAL_BOOK_DEPTH",
-        description="If true, uses current orderbook depth when historical depth snapshots are unavailable",
+    historical_liquidity_policy: Literal["required", "skip_size_signal"] = Field(
+        default="skip_size_signal",
+        alias="SCAN_HISTORICAL_LIQUIDITY_POLICY",
+        description="Behavior when historical liquidity snapshot at-or-before trade time is missing",
     )
     pre_move_weight: float = Field(
         default=0.10,
@@ -868,6 +945,9 @@ class Settings(BaseSettings):
             "liquidity": {
                 "volume_window_hours": str(self.liquidity.volume_window_hours),
                 "depth_max_slippage_bps": str(self.liquidity.depth_max_slippage_bps),
+                "snapshot_cadence_seconds": str(self.liquidity.snapshot_cadence_seconds),
+                "market_min_coverage_ratio": str(self.liquidity.market_min_coverage_ratio),
+                "run_min_coverage_ratio": str(self.liquidity.run_min_coverage_ratio),
             },
             "funding": {
                 "lookback_days": str(self.funding.lookback_days),
@@ -877,6 +957,7 @@ class Settings(BaseSettings):
                 "embedding_model": self.scan.embedding_model or "(not set)",
                 "top_k_markets": str(self.scan.top_k_markets),
                 "pre_move_weight": str(self.scan.pre_move_weight),
+                "historical_liquidity_policy": self.scan.historical_liquidity_policy,
             },
             "discord_enabled": str(self.discord.enabled),
             "telegram_enabled": str(self.telegram.enabled),
@@ -885,7 +966,9 @@ class Settings(BaseSettings):
             "dry_run": str(self.dry_run),
         }
 
-    def validate_requirements(self, *, command: Literal["run", "scan", "train-model"]) -> None:
+    def validate_requirements(
+        self, *, command: Literal["run", "scan", "train-model", "liquidity-coverage-backfill"]
+    ) -> None:
         """Validate command-specific requirements.
 
         This is strict by design: if a capability is required for a command

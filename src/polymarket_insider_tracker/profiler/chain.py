@@ -14,13 +14,14 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, cast
 
 from redis.asyncio import Redis
 from web3 import AsyncWeb3
 from web3.exceptions import Web3Exception
+from web3.middleware import ExtraDataToPOAMiddleware
 from web3.providers import AsyncHTTPProvider
 
 
@@ -36,6 +37,25 @@ DEFAULT_REQUEST_TIMEOUT = 30
 
 # Cache TTL for latest block (fast-changing)
 LATEST_BLOCK_CACHE_TTL_SECONDS = 2
+
+
+def _json_default(value: object) -> object:
+    """Serialize Web3 RPC objects that stdlib json can't encode."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "0x" + bytes(value).hex()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    hex_method = getattr(value, "hex", None)
+    if callable(hex_method):
+        try:
+            hex_value = hex_method()
+            if isinstance(hex_value, str):
+                return hex_value
+        except Exception:
+            pass
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 class PolygonClientError(Exception):
@@ -145,10 +165,10 @@ class PolygonClient:
         self._retry_delay = retry_delay_seconds
 
         # Create web3 instances
-        self._w3 = AsyncWeb3(AsyncHTTPProvider(rpc_url))
+        self._w3 = self._new_web3_client(rpc_url)
         self._w3_fallback: AsyncWeb3[AsyncHTTPProvider] | None = None
         if fallback_rpc_url:
-            self._w3_fallback = AsyncWeb3(AsyncHTTPProvider(fallback_rpc_url))
+            self._w3_fallback = self._new_web3_client(fallback_rpc_url)
 
         # Rate limiter
         self._rate_limiter = RateLimiter.create(max_requests_per_second)
@@ -160,6 +180,17 @@ class PolygonClient:
 
         # Cache key prefix
         self._cache_prefix = "polygon:"
+
+    def _new_web3_client(self, rpc_url: str) -> AsyncWeb3[AsyncHTTPProvider]:
+        client = AsyncWeb3(AsyncHTTPProvider(rpc_url))
+        self._inject_poa_middleware(client, rpc_url=rpc_url)
+        return client
+
+    def _inject_poa_middleware(self, client: AsyncWeb3[AsyncHTTPProvider], *, rpc_url: str) -> None:
+        try:
+            client.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        except Exception as e:
+            logger.warning("Failed to inject PoA middleware (rpc=%s): %s", rpc_url, e)
 
     def _cache_key(self, key_type: str, address: str) -> str:
         """Generate a cache key."""
@@ -540,7 +571,7 @@ class PolygonClient:
         block_dict["timestamp"] = int(block_dict["timestamp"])
 
         # Cache result (blocks are immutable, use longer TTL)
-        await self._set_cached(cache_key, json.dumps(block_dict), ttl=3600)
+        await self._set_cached(cache_key, json.dumps(block_dict, default=_json_default), ttl=3600)
 
         return dict(block_dict)
 
@@ -569,7 +600,11 @@ class PolygonClient:
         block_dict["timestamp"] = int(block_dict["timestamp"])
 
         # Cache briefly
-        await self._set_cached(cache_key, json.dumps(block_dict), ttl=LATEST_BLOCK_CACHE_TTL_SECONDS)
+        await self._set_cached(
+            cache_key,
+            json.dumps(block_dict, default=_json_default),
+            ttl=LATEST_BLOCK_CACHE_TTL_SECONDS,
+        )
         return dict(block_dict)
 
     async def get_block_number_at_or_before(self, ts: datetime) -> int:
@@ -622,3 +657,20 @@ class PolygonClient:
             return True
         except RPCError:
             return False
+
+    async def aclose(self) -> None:
+        """Close async HTTP provider sessions to avoid leaked aiohttp sessions."""
+        providers = [self._w3.provider]
+        if self._w3_fallback is not None:
+            providers.append(self._w3_fallback.provider)
+
+        for provider in providers:
+            disconnect = getattr(provider, "disconnect", None)
+            if not callable(disconnect):
+                continue
+            try:
+                result = disconnect()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning("Failed to close RPC provider session: %s", e)

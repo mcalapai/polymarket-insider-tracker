@@ -7,6 +7,7 @@ funding transfers, and wallet relationships.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -17,16 +18,18 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+from polymarket_insider_tracker.ingestor.liquidity import floor_to_cadence_bucket
 from polymarket_insider_tracker.storage.models import (
     BacktestRunModel,
     CancelModel,
     ERC20TransferModel,
+    LiquidityCoverageModel,
+    LiquiditySnapshotModel,
     MarketEntryModel,
     MarketDailyBaselineModel,
     MarketModel,
     MarketPriceBarModel,
     MarketStateModel,
-    LiquiditySnapshotModel,
     ModelArtifactModel,
     OrderEventModel,
     OrderModel,
@@ -623,6 +626,202 @@ class LiquiditySnapshotRepository:
         )
         model = result.scalar_one_or_none()
         return LiquiditySnapshotDTO.from_model(model) if model else None
+
+
+@dataclass
+class LiquidityCoverageDTO:
+    condition_id: str
+    asset_id: str
+    window_start: datetime
+    window_end: datetime
+    cadence_seconds: int
+    expected_snapshots: int
+    observed_snapshots: int
+    coverage_ratio: Decimal
+    availability_status: str
+    computed_at: datetime
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    @classmethod
+    def from_model(cls, model: LiquidityCoverageModel) -> LiquidityCoverageDTO:
+        return cls(
+            condition_id=model.condition_id,
+            asset_id=model.asset_id,
+            window_start=model.window_start,
+            window_end=model.window_end,
+            cadence_seconds=model.cadence_seconds,
+            expected_snapshots=model.expected_snapshots,
+            observed_snapshots=model.observed_snapshots,
+            coverage_ratio=model.coverage_ratio,
+            availability_status=model.availability_status,
+            computed_at=model.computed_at,
+            created_at=model.created_at,
+            updated_at=model.updated_at,
+        )
+
+
+class LiquidityCoverageRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def upsert(self, dto: LiquidityCoverageDTO) -> None:
+        now = datetime.now(UTC)
+        values = {
+            "condition_id": dto.condition_id,
+            "asset_id": dto.asset_id,
+            "window_start": dto.window_start,
+            "window_end": dto.window_end,
+            "cadence_seconds": dto.cadence_seconds,
+            "expected_snapshots": dto.expected_snapshots,
+            "observed_snapshots": dto.observed_snapshots,
+            "coverage_ratio": dto.coverage_ratio,
+            "availability_status": dto.availability_status,
+            "computed_at": dto.computed_at,
+        }
+        index_elements = ["condition_id", "asset_id", "window_start", "window_end"]
+        try:
+            stmt = pg_insert(LiquidityCoverageModel).values(**values, created_at=now, updated_at=now)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=index_elements,
+                set_={
+                    "cadence_seconds": stmt.excluded.cadence_seconds,
+                    "expected_snapshots": stmt.excluded.expected_snapshots,
+                    "observed_snapshots": stmt.excluded.observed_snapshots,
+                    "coverage_ratio": stmt.excluded.coverage_ratio,
+                    "availability_status": stmt.excluded.availability_status,
+                    "computed_at": stmt.excluded.computed_at,
+                    "updated_at": now,
+                },
+            )
+            await self.session.execute(stmt)
+        except Exception:
+            sqlite_stmt = sqlite_insert(LiquidityCoverageModel).values(
+                **values, created_at=now, updated_at=now
+            )
+            sqlite_stmt = sqlite_stmt.on_conflict_do_update(
+                index_elements=index_elements,
+                set_={
+                    "cadence_seconds": sqlite_stmt.excluded.cadence_seconds,
+                    "expected_snapshots": sqlite_stmt.excluded.expected_snapshots,
+                    "observed_snapshots": sqlite_stmt.excluded.observed_snapshots,
+                    "coverage_ratio": sqlite_stmt.excluded.coverage_ratio,
+                    "availability_status": sqlite_stmt.excluded.availability_status,
+                    "computed_at": sqlite_stmt.excluded.computed_at,
+                    "updated_at": now,
+                },
+            )
+            await self.session.execute(sqlite_stmt)
+        await self.session.flush()
+
+    async def upsert_many(self, items: list[LiquidityCoverageDTO]) -> None:
+        for dto in items:
+            await self.upsert(dto)
+
+    async def compute_window_for_pairs(
+        self,
+        *,
+        pairs: list[tuple[str, str]],
+        window_start: datetime,
+        window_end: datetime,
+        cadence_seconds: int,
+        computed_at: datetime | None = None,
+    ) -> list[LiquidityCoverageDTO]:
+        if window_start.tzinfo is None or window_end.tzinfo is None:
+            raise ValueError("window_start/window_end must be timezone-aware")
+        if cadence_seconds < 1:
+            raise ValueError("cadence_seconds must be >= 1")
+        if window_end < window_start:
+            raise ValueError("window_end must be >= window_start")
+        if not pairs:
+            return []
+
+        unique_pairs = sorted({(c, a) for c, a in pairs})
+        start_bucket = floor_to_cadence_bucket(window_start, cadence_seconds=cadence_seconds)
+        end_bucket = floor_to_cadence_bucket(window_end, cadence_seconds=cadence_seconds)
+        expected = int((end_bucket - start_bucket).total_seconds() // cadence_seconds) + 1
+        pair_filter = sa.tuple_(LiquiditySnapshotModel.condition_id, LiquiditySnapshotModel.asset_id).in_(
+            unique_pairs
+        )
+
+        observed_result = await self.session.execute(
+            select(
+                LiquiditySnapshotModel.condition_id.label("condition_id"),
+                LiquiditySnapshotModel.asset_id.label("asset_id"),
+                sa.func.count(sa.distinct(LiquiditySnapshotModel.computed_at)).label("observed"),
+            )
+            .where(
+                pair_filter
+                & (LiquiditySnapshotModel.computed_at >= start_bucket)
+                & (LiquiditySnapshotModel.computed_at <= end_bucket)
+            )
+            .group_by(LiquiditySnapshotModel.condition_id, LiquiditySnapshotModel.asset_id)
+        )
+        observed_map = {
+            (str(row.condition_id), str(row.asset_id)): int(row.observed) for row in observed_result.fetchall()
+        }
+
+        first_seen_result = await self.session.execute(
+            select(
+                LiquiditySnapshotModel.condition_id.label("condition_id"),
+                LiquiditySnapshotModel.asset_id.label("asset_id"),
+                sa.func.min(LiquiditySnapshotModel.computed_at).label("first_seen"),
+            )
+            .where(pair_filter)
+            .group_by(LiquiditySnapshotModel.condition_id, LiquiditySnapshotModel.asset_id)
+        )
+        first_seen_map = {
+            (str(row.condition_id), str(row.asset_id)): row.first_seen for row in first_seen_result.fetchall()
+        }
+
+        now = computed_at or datetime.now(UTC)
+        results: list[LiquidityCoverageDTO] = []
+        for condition_id, asset_id in unique_pairs:
+            observed = observed_map.get((condition_id, asset_id), 0)
+            first_seen = first_seen_map.get((condition_id, asset_id))
+            status = "measured"
+            if first_seen is None or first_seen > start_bucket:
+                status = "unavailable"
+            ratio = Decimal("0")
+            if expected > 0:
+                ratio = min(
+                    Decimal("1"),
+                    (Decimal(observed) / Decimal(expected)).quantize(Decimal("0.00000001")),
+                )
+            results.append(
+                LiquidityCoverageDTO(
+                    condition_id=condition_id,
+                    asset_id=asset_id,
+                    window_start=start_bucket,
+                    window_end=end_bucket,
+                    cadence_seconds=cadence_seconds,
+                    expected_snapshots=expected,
+                    observed_snapshots=observed,
+                    coverage_ratio=ratio,
+                    availability_status=status,
+                    computed_at=now,
+                )
+            )
+        return results
+
+    async def compute_and_upsert_window(
+        self,
+        *,
+        pairs: list[tuple[str, str]],
+        window_start: datetime,
+        window_end: datetime,
+        cadence_seconds: int,
+        computed_at: datetime | None = None,
+    ) -> list[LiquidityCoverageDTO]:
+        rows = await self.compute_window_for_pairs(
+            pairs=pairs,
+            window_start=window_start,
+            window_end=window_end,
+            cadence_seconds=cadence_seconds,
+            computed_at=computed_at,
+        )
+        await self.upsert_many(rows)
+        return rows
 
 @dataclass
 class MarketPriceBarDTO:

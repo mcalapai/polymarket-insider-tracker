@@ -339,6 +339,21 @@ class TestSettings:
             settings = Settings()
             settings.validate_requirements(command="scan")
 
+    def test_scan_historical_liquidity_policy_validation(self) -> None:
+        """Invalid historical liquidity policy must fail fast."""
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgresql://user:pass@localhost/db",
+                    "SCAN_HISTORICAL_LIQUIDITY_POLICY": "invalid-policy",
+                },
+                clear=True,
+            ),
+            pytest.raises(ValidationError),
+        ):
+            Settings()
+
     def test_redacted_summary(self) -> None:
         """Test redacted_summary masks sensitive data."""
         with patch.dict(

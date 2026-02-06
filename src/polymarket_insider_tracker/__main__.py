@@ -15,6 +15,7 @@ import json
 import logging
 import logging.config
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
@@ -109,6 +110,28 @@ Examples:
 
     train_parser = subparsers.add_parser("train-model", help="Train a self-supervised model")
     train_parser.set_defaults(command="train-model")
+
+    backfill_parser = subparsers.add_parser(
+        "liquidity-coverage-backfill",
+        help="Backfill liquidity coverage metadata from existing snapshots",
+    )
+    backfill_parser.add_argument(
+        "--start",
+        required=True,
+        help="Window start (ISO-8601, timezone-aware)",
+    )
+    backfill_parser.add_argument(
+        "--end",
+        required=True,
+        help="Window end (ISO-8601, timezone-aware)",
+    )
+    backfill_parser.add_argument(
+        "--cadence-seconds",
+        type=int,
+        default=None,
+        help="Optional cadence override (defaults to LIQUIDITY_SNAPSHOT_CADENCE_SECONDS)",
+    )
+    backfill_parser.set_defaults(command="liquidity-coverage-backfill")
 
     return parser
 
@@ -343,6 +366,43 @@ def main(argv: list[str] | None = None) -> NoReturn:
         from polymarket_insider_tracker.training.runner import train_model
 
         asyncio.run(train_model(settings=settings))
+        sys.exit(EXIT_SUCCESS)
+
+    if command == "liquidity-coverage-backfill":
+        from polymarket_insider_tracker.scan.liquidity_coverage_backfill import (
+            backfill_liquidity_coverage,
+        )
+
+        try:
+            window_start = datetime.fromisoformat(str(args.start))
+            window_end = datetime.fromisoformat(str(args.end))
+        except ValueError as e:
+            print(f"Invalid --start/--end timestamp: {e}", file=sys.stderr)
+            sys.exit(EXIT_CONFIG_ERROR)
+
+        if window_start.tzinfo is None or window_end.tzinfo is None:
+            print("--start and --end must include timezone offsets", file=sys.stderr)
+            sys.exit(EXIT_CONFIG_ERROR)
+
+        result = asyncio.run(
+            backfill_liquidity_coverage(
+                settings=settings,
+                window_start=window_start,
+                window_end=window_end,
+                cadence_seconds=args.cadence_seconds,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "pairs_considered": result.pairs_considered,
+                    "rows_upserted": result.rows_upserted,
+                    "unavailable_pairs": result.unavailable_pairs,
+                    "window_start": result.window_start.isoformat(),
+                    "window_end": result.window_end.isoformat(),
+                }
+            )
+        )
         sys.exit(EXIT_SUCCESS)
 
     print(f"Unknown command: {command}", file=sys.stderr)

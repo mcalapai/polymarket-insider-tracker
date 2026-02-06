@@ -288,6 +288,28 @@ class TestClobClient:
         assert len(markets) == 1
         assert markets[0].condition_id == "0x1"
 
+    def test_get_markets_parses_tradable_flags(self, mock_base_client: MagicMock) -> None:
+        """Tradable flags should be parsed from simplified markets payload."""
+        mock_base_client.get_simplified_markets.return_value = {
+            "data": [
+                {
+                    "condition_id": "0x1",
+                    "active": True,
+                    "closed": False,
+                    "accepting_orders": False,
+                    "enable_order_book": True,
+                }
+            ],
+            "next_cursor": "LTE=",
+        }
+
+        client = ClobClient()
+        markets = client.get_markets(active_only=False)
+
+        assert len(markets) == 1
+        assert markets[0].accepting_orders is False
+        assert markets[0].enable_order_book is True
+
     def test_get_markets_includes_closed(self, mock_base_client: MagicMock) -> None:
         """Test that closed markets are included when active_only=False."""
         mock_base_client.get_simplified_markets.return_value = {

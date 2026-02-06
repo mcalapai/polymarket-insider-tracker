@@ -12,6 +12,7 @@ from polymarket_insider_tracker.storage.database import (
 from polymarket_insider_tracker.storage.models import (
     Base,
     ERC20TransferModel,
+    LiquidityCoverageModel,
     MarketDailyBaselineModel,
     MarketEntryModel,
     MarketPriceBarModel,
@@ -26,6 +27,8 @@ from polymarket_insider_tracker.storage.models import (
 from polymarket_insider_tracker.storage.repos import (
     ERC20TransferDTO,
     ERC20TransferRepository,
+    LiquidityCoverageDTO,
+    LiquidityCoverageRepository,
     MarketDailyBaselineDTO,
     MarketDailyBaselineRepository,
     MarketEntryDTO,
@@ -52,6 +55,9 @@ __all__ = [
     "ERC20TransferDTO",
     "ERC20TransferModel",
     "ERC20TransferRepository",
+    "LiquidityCoverageDTO",
+    "LiquidityCoverageModel",
+    "LiquidityCoverageRepository",
     "MarketDailyBaselineDTO",
     "MarketDailyBaselineModel",
     "MarketDailyBaselineRepository",

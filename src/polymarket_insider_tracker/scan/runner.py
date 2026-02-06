@@ -18,13 +18,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import TypeVar
+from typing import Awaitable, Callable, TypeVar
 
-from redis.asyncio import Redis
 from py_clob_client.clob_types import ApiCreds
+from redis.asyncio import Redis
 
 from polymarket_insider_tracker.config import Settings
-from polymarket_insider_tracker.detector.digit_distribution import DigitDistributionDetector
+from polymarket_insider_tracker.detector.digit_distribution import (
+    DigitDistributionDetector,
+    DigitDistributionDetectorError,
+)
 from polymarket_insider_tracker.detector.fresh_wallet import FreshWalletDetector
 from polymarket_insider_tracker.detector.models import (
     CoEntryCorrelationSignal,
@@ -37,8 +40,14 @@ from polymarket_insider_tracker.detector.pre_move import PreMoveDetector, PreMov
 from polymarket_insider_tracker.detector.scorer import DEFAULT_WEIGHTS, RiskScorer, SignalBundle
 from polymarket_insider_tracker.detector.size_anomaly import LiquidityInputs, SizeAnomalyDetector
 from polymarket_insider_tracker.detector.sniper import SniperDetector
-from polymarket_insider_tracker.detector.trade_size_outlier import TradeSizeOutlierDetector
-from polymarket_insider_tracker.detector.trade_slicing import TradeSlicingDetector
+from polymarket_insider_tracker.detector.trade_size_outlier import (
+    TradeSizeOutlierDetector,
+    TradeSizeOutlierDetectorError,
+)
+from polymarket_insider_tracker.detector.trade_slicing import (
+    TradeSlicingDetector,
+    TradeSlicingDetectorError,
+)
 from polymarket_insider_tracker.ingestor.baselines import (
     RollingDigitConfig,
     RollingDigitDistributionCache,
@@ -52,11 +61,11 @@ from polymarket_insider_tracker.ingestor.clob_client import (
     RetryError,
 )
 from polymarket_insider_tracker.ingestor.flow import RollingFlowConfig, RollingWalletMarketFlowCache
-from polymarket_insider_tracker.ingestor.liquidity import compute_visible_book_depth_usdc, now_utc
+from polymarket_insider_tracker.ingestor.liquidity import now_utc
 from polymarket_insider_tracker.ingestor.volume import RollingVolumeCache, RollingVolumeConfig
 from polymarket_insider_tracker.profiler.analyzer import WalletAnalyzer, WalletAnalyzerError
-from polymarket_insider_tracker.profiler.chain import PolygonClient
-from polymarket_insider_tracker.profiler.funding import FundingTracer
+from polymarket_insider_tracker.profiler.chain import PolygonClient, RPCError
+from polymarket_insider_tracker.profiler.funding import FundingTraceError, FundingTracer
 from polymarket_insider_tracker.scan.embeddings import EmbeddingConfig, SentenceTransformerEmbeddingProvider
 from polymarket_insider_tracker.scan.market_indexer import MarketIndexer
 from polymarket_insider_tracker.scan.search import MarketSearch, MarketSearchConfig
@@ -64,6 +73,8 @@ from polymarket_insider_tracker.storage.database import DatabaseManager
 from polymarket_insider_tracker.storage.repos import (
     BacktestRunDTO,
     BacktestRunRepository,
+    LiquidityCoverageDTO,
+    LiquidityCoverageRepository,
     LiquiditySnapshotRepository,
     MarketRepository,
     MarketPriceBarDTO,
@@ -95,15 +106,98 @@ class ScanError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class LiquidityCoverageDecision:
+    condition_id: str
+    asset_id: str
+    coverage_ratio: float
+    availability_status: str
+    enabled: bool
+    reason: str | None
+
+
 def _json_default(x: object) -> str:
     if isinstance(x, (datetime,)):
         return x.isoformat()
     return str(x)
 
+
+def _walk_exception_chain(error: BaseException) -> list[str]:
+    seen: set[int] = set()
+    out: list[str] = []
+    cur: BaseException | None = error
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        out.append(str(cur))
+        nxt = cur.__cause__
+        if nxt is None:
+            nxt = cur.__context__
+        cur = nxt
+    return out
+
+
+def _is_rpc_history_constraint(error: BaseException) -> bool:
+    message = " | ".join(_walk_exception_chain(error)).lower()
+    return any(
+        token in message
+        for token in (
+            "block range is too large",
+            "history has been pruned",
+            "-32062",
+            "-32701",
+        )
+    )
+
 def _chunked(items: list[T], size: int) -> list[list[T]]:
     if size < 1:
         raise ValueError("chunk size must be >= 1")
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+async def _analyze_optional_signal(
+    *,
+    detector_name: str,
+    analyze_fn: Callable[[], Awaitable[object | None]],
+    skippable_errors: tuple[type[Exception], ...],
+) -> tuple[object | None, dict[str, object] | None]:
+    try:
+        signal = await analyze_fn()
+        return signal, None
+    except skippable_errors as e:
+        return None, {
+            "reason": "detector_prerequisites_unavailable",
+            "detector": detector_name,
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
+
+
+def _build_liquidity_coverage_decisions(
+    coverage_rows: list[LiquidityCoverageDTO],
+    *,
+    min_market_coverage_ratio: float,
+) -> dict[tuple[str, str], LiquidityCoverageDecision]:
+    decisions: dict[tuple[str, str], LiquidityCoverageDecision] = {}
+    for row in coverage_rows:
+        key = (row.condition_id, row.asset_id)
+        ratio = float(row.coverage_ratio)
+        enabled = True
+        reason: str | None = None
+        if row.availability_status != "measured":
+            enabled = False
+            reason = "coverage_unavailable_before_collection_start"
+        elif ratio < min_market_coverage_ratio:
+            enabled = False
+            reason = "coverage_below_market_threshold"
+        decisions[key] = LiquidityCoverageDecision(
+            condition_id=row.condition_id,
+            asset_id=row.asset_id,
+            coverage_ratio=ratio,
+            availability_status=row.availability_status,
+            enabled=enabled,
+            reason=reason,
+        )
+    return decisions
 
 
 async def run_scan(
@@ -122,6 +216,7 @@ async def run_scan(
 
     redis = Redis.from_url(settings.redis.url)
     db = DatabaseManager(settings.database.url, async_mode=True)
+    polygon: PolygonClient | None = None
     try:
         started_at = datetime.now(UTC)
         # Prefix all rolling caches with a per-run namespace for determinism.
@@ -495,8 +590,70 @@ async def run_scan(
                 wallet_sniper = best_sniper
                 wallet_coentry = best_co
 
+            run_window_start = trades[0].ts
+            run_window_end = trades[-1].ts
+            market_asset_pairs = sorted({(t.market_id, t.asset_id) for t in trades})
+
+            coverage_repo = LiquidityCoverageRepository(session)
+            coverage_rows = await coverage_repo.compute_and_upsert_window(
+                pairs=market_asset_pairs,
+                window_start=run_window_start,
+                window_end=run_window_end,
+                cadence_seconds=settings.liquidity.snapshot_cadence_seconds,
+                computed_at=now_utc(),
+            )
+            coverage_decisions = _build_liquidity_coverage_decisions(
+                coverage_rows,
+                min_market_coverage_ratio=settings.liquidity.market_min_coverage_ratio,
+            )
+            disabled_pair_records = [
+                {
+                    "condition_id": d.condition_id,
+                    "asset_id": d.asset_id,
+                    "coverage_ratio": d.coverage_ratio,
+                    "availability_status": d.availability_status,
+                    "reason": d.reason,
+                }
+                for d in coverage_decisions.values()
+                if not d.enabled
+            ]
+            run_coverage_ratio = 0.0
+            if coverage_rows:
+                run_coverage_ratio = sum(float(r.coverage_ratio) for r in coverage_rows) / len(coverage_rows)
+            liquidity_coverage_ok = run_coverage_ratio >= settings.liquidity.run_min_coverage_ratio
+
+            logger.info(
+                "Liquidity coverage summary window=[%s,%s] pairs=%d disabled=%d avg_ratio=%.4f run_ok=%s",
+                run_window_start.isoformat(),
+                run_window_end.isoformat(),
+                len(coverage_rows),
+                len(disabled_pair_records),
+                run_coverage_ratio,
+                liquidity_coverage_ok,
+            )
+
+            liquidity_telemetry: dict[str, int] = {
+                "trades_total": 0,
+                "trades_with_hist_liquidity": 0,
+                "trades_missing_hist_liquidity": 0,
+                "trades_size_signal_skipped": 0,
+                "trades_size_signal_computed": 0,
+                "trades_size_signal_disabled_by_coverage": 0,
+            }
+            enrichment_telemetry: dict[str, int] = {
+                "fresh_wallet_failures": 0,
+                "funding_trace_failures": 0,
+                "fresh_wallet_disabled_by_rpc_history": 0,
+                "funding_disabled_by_rpc_history": 0,
+            }
+            fresh_wallet_enabled = True
+            fresh_wallet_disabled_reason: str | None = None
+            funding_trace_enabled = True
+            funding_trace_disabled_reason: str | None = None
+
             commit_every = 1000
             for idx, t in enumerate(trades, start=1):
+                liquidity_telemetry["trades_total"] += 1
                 total_considered += 1
                 # Update rolling caches (deterministic for this replay).
                 await volume_cache.record_trade_notional(t.market_id, ts=t.ts, notional_usdc=t.notional_usdc)
@@ -544,56 +701,133 @@ async def run_scan(
                 )
 
                 fresh_signal = None
+                fresh_missing_payload: dict[str, object] | None = None
                 if t.notional_usdc >= settings.fresh_wallet.min_trade_notional_usdc:
-                    wallet_snapshot = await wallet_analyzer.analyze(t.wallet_address, as_of=t.ts)
-                    await wallet_repo.upsert(
-                        WalletSnapshotDTO(
-                            address=wallet_snapshot.address,
-                            as_of_block_number=wallet_snapshot.as_of_block_number,
-                            as_of=wallet_snapshot.as_of,
-                            nonce_as_of=wallet_snapshot.nonce_as_of,
-                            first_funding_at=wallet_snapshot.first_funding_at,
-                            age_hours_as_of=Decimal(str(wallet_snapshot.age_hours_as_of)),
-                            matic_balance_wei_as_of=wallet_snapshot.matic_balance_wei_as_of,
-                            usdc_balance_units_as_of=wallet_snapshot.usdc_balance_units_as_of,
-                            computed_at=wallet_snapshot.computed_at,
-                        )
-                    )
-                    fresh_signal = await fresh.analyze(trade_event, wallet_snapshot=wallet_snapshot)
+                    if not fresh_wallet_enabled:
+                        fresh_missing_payload = {
+                            "reason": fresh_wallet_disabled_reason
+                            or "wallet_snapshot_unavailable_for_run",
+                        }
+                    else:
+                        try:
+                            wallet_snapshot = await wallet_analyzer.analyze(t.wallet_address, as_of=t.ts)
+                            await wallet_repo.upsert(
+                                WalletSnapshotDTO(
+                                    address=wallet_snapshot.address,
+                                    as_of_block_number=wallet_snapshot.as_of_block_number,
+                                    as_of=wallet_snapshot.as_of,
+                                    nonce_as_of=wallet_snapshot.nonce_as_of,
+                                    first_funding_at=wallet_snapshot.first_funding_at,
+                                    age_hours_as_of=Decimal(str(wallet_snapshot.age_hours_as_of)),
+                                    matic_balance_wei_as_of=wallet_snapshot.matic_balance_wei_as_of,
+                                    usdc_balance_units_as_of=wallet_snapshot.usdc_balance_units_as_of,
+                                    computed_at=wallet_snapshot.computed_at,
+                                )
+                            )
+                            fresh_signal = await fresh.analyze(trade_event, wallet_snapshot=wallet_snapshot)
+                        except (WalletAnalyzerError, FundingTraceError, RPCError) as e:
+                            enrichment_telemetry["fresh_wallet_failures"] += 1
+                            reason = "wallet_snapshot_unavailable"
+                            if _is_rpc_history_constraint(e):
+                                reason = "rpc_history_unavailable_for_wallet_snapshot"
+                                if fresh_wallet_enabled:
+                                    fresh_wallet_enabled = False
+                                    fresh_wallet_disabled_reason = reason
+                                    enrichment_telemetry["fresh_wallet_disabled_by_rpc_history"] += 1
+                                    logger.warning(
+                                        "Disabling fresh_wallet for remainder of scan: %s",
+                                        str(e),
+                                    )
+                            fresh_missing_payload = {
+                                "reason": reason,
+                                "error_type": type(e).__name__,
+                                "error_message": str(e),
+                            }
 
-                # Liquidity inputs (strict).
-                liq = await liq_repo.get_latest_before(
-                    condition_id=t.market_id,
-                    asset_id=t.asset_id,
-                    as_of=t.ts,
-                )
-                if liq is None:
-                    if not settings.scan.allow_non_historical_book_depth:
-                        raise ScanError(
-                            f"Missing historical liquidity snapshot for market={t.market_id} asset={t.asset_id}"
-                        )
-                    # Explicitly non-historical: compute from current book.
-                    ob = await asyncio.to_thread(clob.get_orderbook, t.asset_id)
-                    depth, _mid = compute_visible_book_depth_usdc(
-                        ob,
-                        max_slippage_bps=settings.liquidity.depth_max_slippage_bps,
+                size_signal = None
+                size_missing_payload: dict[str, object] | None = None
+                coverage_decision = coverage_decisions.get((t.market_id, t.asset_id))
+                if coverage_decision is None:
+                    coverage_decision = LiquidityCoverageDecision(
+                        condition_id=t.market_id,
+                        asset_id=t.asset_id,
+                        coverage_ratio=0.0,
+                        availability_status="unavailable",
+                        enabled=False,
+                        reason="coverage_not_computed_for_market_asset",
                     )
-                    visible_depth = depth
+
+                if not coverage_decision.enabled:
+                    liquidity_telemetry["trades_size_signal_skipped"] += 1
+                    liquidity_telemetry["trades_size_signal_disabled_by_coverage"] += 1
+                    size_missing_payload = {
+                        "reason": coverage_decision.reason,
+                        "coverage_ratio": coverage_decision.coverage_ratio,
+                        "availability_status": coverage_decision.availability_status,
+                    }
                 else:
-                    visible_depth = liq.visible_book_depth_usdc
+                    liq = await liq_repo.get_latest_before(
+                        condition_id=t.market_id,
+                        asset_id=t.asset_id,
+                        as_of=t.ts,
+                    )
+                    if liq is None:
+                        liquidity_telemetry["trades_missing_hist_liquidity"] += 1
+                        if settings.scan.historical_liquidity_policy == "required":
+                            raise ScanError(
+                                "Missing historical liquidity snapshot for "
+                                f"market={t.market_id} asset={t.asset_id} at ts={t.ts.isoformat()}"
+                            )
+                        liquidity_telemetry["trades_size_signal_skipped"] += 1
+                        size_missing_payload = {
+                            "reason": "missing_historical_snapshot_at_trade_time",
+                            "policy": settings.scan.historical_liquidity_policy,
+                            "coverage_ratio": coverage_decision.coverage_ratio,
+                        }
+                    else:
+                        liquidity_telemetry["trades_with_hist_liquidity"] += 1
+                        rolling_volume = await volume_cache.get_rolling_volume(t.market_id, as_of=t.ts)
+                        size_signal = await size_anomaly.analyze(
+                            trade_event,
+                            liquidity=LiquidityInputs(
+                                rolling_24h_volume_usdc=rolling_volume,
+                                visible_book_depth_usdc=liq.visible_book_depth_usdc,
+                            ),
+                        )
+                        liquidity_telemetry["trades_size_signal_computed"] += 1
 
-                rolling_volume = await volume_cache.get_rolling_volume(t.market_id, as_of=t.ts)
-                size_signal = await size_anomaly.analyze(
-                    trade_event,
-                    liquidity=LiquidityInputs(
-                        rolling_24h_volume_usdc=rolling_volume,
-                        visible_book_depth_usdc=visible_depth,
-                    ),
+                missing_input_signals: list[tuple[str, dict[str, object]]] = []
+                if fresh_missing_payload is not None:
+                    missing_input_signals.append(("fresh_wallet_missing_input", fresh_missing_payload))
+                if size_missing_payload is not None:
+                    missing_input_signals.append(("size_anomaly_missing_input", size_missing_payload))
+
+                outlier_signal_obj, outlier_missing = await _analyze_optional_signal(
+                    detector_name="trade_size_outlier",
+                    analyze_fn=lambda: outlier.analyze(trade_event),
+                    skippable_errors=(TradeSizeOutlierDetectorError,),
                 )
+                outlier_signal = outlier_signal_obj
+                if outlier_missing is not None:
+                    missing_input_signals.append(("trade_size_outlier_missing_input", outlier_missing))
 
-                outlier_signal = await outlier.analyze(trade_event)
-                digit_signal = await digits.analyze(trade_event)
-                slicing_signal = await slicing.analyze(trade_event)
+                digit_signal_obj, digit_missing = await _analyze_optional_signal(
+                    detector_name="digit_distribution",
+                    analyze_fn=lambda: digits.analyze(trade_event),
+                    skippable_errors=(DigitDistributionDetectorError,),
+                )
+                digit_signal = digit_signal_obj
+                if digit_missing is not None:
+                    missing_input_signals.append(("digit_distribution_missing_input", digit_missing))
+
+                slicing_signal_obj, slicing_missing = await _analyze_optional_signal(
+                    detector_name="trade_slicing",
+                    analyze_fn=lambda: slicing.analyze(trade_event),
+                    skippable_errors=(TradeSlicingDetectorError,),
+                )
+                slicing_signal = slicing_signal_obj
+                if slicing_missing is not None:
+                    missing_input_signals.append(("trade_slicing_missing_input", slicing_missing))
 
                 wallet = t.wallet_address.lower()
                 sniper_signal = wallet_sniper.get(wallet)
@@ -617,13 +851,48 @@ async def run_scan(
                     should_trace = float(t.notional_usdc) >= settings.funding.trace_high_water_notional_usdc
 
                 if should_trace:
-                    cached = funding_cache.get(wallet)
-                    funding_signal = cached
-                    if funding_signal is None:
-                        funding_signal = await compute_funding_signal(wallet_address=wallet, as_of=t.ts)
-                        funding_cache[wallet] = funding_signal
-                    bundle = dataclasses.replace(bundle, funding_signal=funding_signal)
-                    assessment = await scorer_trade_time.assess(bundle)
+                    if not funding_trace_enabled:
+                        missing_input_signals.append(
+                            (
+                                "funding_missing_input",
+                                {
+                                    "reason": funding_trace_disabled_reason
+                                    or "funding_trace_unavailable_for_run",
+                                },
+                            )
+                        )
+                    else:
+                        try:
+                            cached = funding_cache.get(wallet)
+                            funding_signal = cached
+                            if funding_signal is None:
+                                funding_signal = await compute_funding_signal(wallet_address=wallet, as_of=t.ts)
+                                funding_cache[wallet] = funding_signal
+                            bundle = dataclasses.replace(bundle, funding_signal=funding_signal)
+                            assessment = await scorer_trade_time.assess(bundle)
+                        except (FundingTraceError, RPCError) as e:
+                            enrichment_telemetry["funding_trace_failures"] += 1
+                            reason = "funding_trace_unavailable"
+                            if _is_rpc_history_constraint(e):
+                                reason = "rpc_history_unavailable_for_funding_trace"
+                                if funding_trace_enabled:
+                                    funding_trace_enabled = False
+                                    funding_trace_disabled_reason = reason
+                                    enrichment_telemetry["funding_disabled_by_rpc_history"] += 1
+                                    logger.warning(
+                                        "Disabling funding trace for remainder of scan: %s",
+                                        str(e),
+                                    )
+                            missing_input_signals.append(
+                                (
+                                    "funding_missing_input",
+                                    {
+                                        "reason": reason,
+                                        "error_type": type(e).__name__,
+                                        "error_message": str(e),
+                                    },
+                                )
+                            )
 
                 await feature_repo.upsert(
                     build_trade_features(bundle=bundle, assessment=assessment, computed_at=now_utc())
@@ -631,6 +900,16 @@ async def run_scan(
 
                 # Persist signals (audit).
                 computed_at = now_utc()
+                for signal_type, payload in missing_input_signals:
+                    await signal_repo.upsert(
+                        TradeSignalDTO(
+                            trade_id=t.trade_id,
+                            signal_type=signal_type,
+                            confidence=Decimal("0"),
+                            payload_json=json.dumps(payload, default=_json_default),
+                            computed_at=computed_at,
+                        )
+                    )
                 for signal_type, signal in (
                     ("fresh_wallet", fresh_signal),
                     ("size_anomaly", size_signal),
@@ -725,6 +1004,7 @@ async def run_scan(
 
                 pre = pre_move_signals.get(t.trade_id)
                 bundle = bundles_by_trade[t.trade_id]
+                pair_decision = coverage_decisions.get((t.market_id, t.asset_id))
 
                 flagged_records.append(
                     {
@@ -742,6 +1022,15 @@ async def run_scan(
                         "risk_score_with_future": future.weighted_score,
                         "would_alert_trade_time": base.should_alert,
                         "would_alert_with_future": future.should_alert,
+                        "run_quality": {"liquidity_coverage_ok": liquidity_coverage_ok},
+                        "liquidity_size_anomaly": {
+                            "enabled_by_coverage": bool(pair_decision.enabled) if pair_decision else False,
+                            "coverage_ratio": pair_decision.coverage_ratio if pair_decision else 0.0,
+                            "availability_status": pair_decision.availability_status
+                            if pair_decision
+                            else "unavailable",
+                            "missing_input": bundle.size_anomaly_signal is None,
+                        },
                         "signals": {
                             "fresh_wallet": bundle.fresh_wallet_signal.to_dict()
                             if bundle.fresh_wallet_signal
@@ -800,8 +1089,22 @@ async def run_scan(
                         {
                             "lookback_days": settings.scan.lookback_days,
                             "top_k_markets": settings.scan.top_k_markets,
-                            "allow_non_historical_book_depth": settings.scan.allow_non_historical_book_depth,
+                            "historical_liquidity_policy": settings.scan.historical_liquidity_policy,
                             "pre_move_weight": settings.scan.pre_move_weight,
+                            "liquidity_coverage": {
+                                "window_start": run_window_start.isoformat(),
+                                "window_end": run_window_end.isoformat(),
+                                "snapshot_cadence_seconds": settings.liquidity.snapshot_cadence_seconds,
+                                "market_min_coverage_ratio": settings.liquidity.market_min_coverage_ratio,
+                                "run_min_coverage_ratio": settings.liquidity.run_min_coverage_ratio,
+                                "run_coverage_ratio": run_coverage_ratio,
+                                "liquidity_coverage_ok": liquidity_coverage_ok,
+                                "pairs_total": len(coverage_rows),
+                                "pairs_disabled": len(disabled_pair_records),
+                                "disabled_pairs": disabled_pair_records,
+                            },
+                            "liquidity_telemetry": liquidity_telemetry,
+                            "enrichment_telemetry": enrichment_telemetry,
                         }
                     ),
                 )
@@ -815,5 +1118,7 @@ async def run_scan(
             total_records_written=written,
         )
     finally:
+        if polygon is not None:
+            await polygon.aclose()
         await redis.aclose()
         await db.dispose_async()

@@ -181,6 +181,46 @@ class LiquiditySnapshotModel(Base):
     )
 
 
+class LiquidityCoverageModel(Base):
+    """Coverage metrics for historical liquidity availability windows."""
+
+    __tablename__ = "liquidity_coverage"
+
+    condition_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+
+    cadence_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_snapshots: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_snapshots: Mapped[int] = mapped_column(Integer, nullable=False)
+    coverage_ratio: Mapped[Decimal] = mapped_column(Numeric(10, 8), nullable=False)
+    availability_status: Mapped[str] = mapped_column(
+        String(20), nullable=False
+    )  # measured|unavailable
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_liquidity_coverage_condition_asset_window_end",
+            "condition_id",
+            "asset_id",
+            "window_end",
+        ),
+        Index("idx_liquidity_coverage_window_end", "window_end"),
+    )
+
+
 class OrderModel(Base):
     """Order details indexed by order hash (Level-2)."""
 

@@ -37,6 +37,8 @@ class Market:
     end_date: datetime | None = None
     active: bool = True
     closed: bool = False
+    accepting_orders: bool = True
+    enable_order_book: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Market":
@@ -58,6 +60,8 @@ class Market:
             end_date=end_date,
             active=bool(data.get("active", True)),
             closed=bool(data.get("closed", False)),
+            accepting_orders=bool(data.get("accepting_orders", True)),
+            enable_order_book=bool(data.get("enable_order_book", True)),
         )
 
 
@@ -362,6 +366,8 @@ class MarketMetadata:
     end_date: datetime | None = None
     active: bool = True
     closed: bool = False
+    accepting_orders: bool = True
+    enable_order_book: bool = True
 
     # Liquidity metrics (optional; updated by liquidity service)
     rolling_24h_volume_usdc: Decimal | None = None
@@ -390,6 +396,8 @@ class MarketMetadata:
             end_date=market.end_date,
             active=market.active,
             closed=market.closed,
+            accepting_orders=market.accepting_orders,
+            enable_order_book=market.enable_order_book,
             last_updated=datetime.now(UTC),
         )
 
@@ -414,6 +422,8 @@ class MarketMetadata:
             "end_date": self.end_date.isoformat() if self.end_date else None,
             "active": self.active,
             "closed": self.closed,
+            "accepting_orders": self.accepting_orders,
+            "enable_order_book": self.enable_order_book,
             "rolling_24h_volume_usdc": str(self.rolling_24h_volume_usdc)
             if self.rolling_24h_volume_usdc is not None
             else None,
@@ -463,6 +473,8 @@ class MarketMetadata:
             end_date=end_date,
             active=bool(data.get("active", True)),
             closed=bool(data.get("closed", False)),
+            accepting_orders=bool(data.get("accepting_orders", True)),
+            enable_order_book=bool(data.get("enable_order_book", True)),
             rolling_24h_volume_usdc=Decimal(str(v))
             if (v := data.get("rolling_24h_volume_usdc")) is not None
             else None,

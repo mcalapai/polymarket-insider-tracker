@@ -61,6 +61,20 @@ class TestCreateParser:
         assert args.dry_run is False
         assert args.health_port is None
 
+    def test_parser_liquidity_coverage_backfill(self):
+        """Parser should accept liquidity coverage backfill command."""
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "liquidity-coverage-backfill",
+                "--start",
+                "2026-01-01T00:00:00+00:00",
+                "--end",
+                "2026-02-01T00:00:00+00:00",
+            ]
+        )
+        assert args.command == "liquidity-coverage-backfill"
+
 
 class TestConfigureLogging:
     """Tests for logging configuration."""

@@ -40,7 +40,7 @@ class LiquiditySnapshot:
         )
 
     @classmethod
-    def from_json(cls, raw: str) -> "LiquiditySnapshot":
+    def from_json(cls, raw: str) -> LiquiditySnapshot:
         data = json.loads(raw)
         return cls(
             condition_id=str(data["condition_id"]),
@@ -89,3 +89,13 @@ def compute_visible_book_depth_usdc(
 def now_utc() -> datetime:
     return datetime.now(UTC)
 
+
+def floor_to_cadence_bucket(ts: datetime, *, cadence_seconds: int) -> datetime:
+    """Floor a timezone-aware timestamp to a deterministic cadence bucket."""
+    if ts.tzinfo is None:
+        raise ValueError("ts must be timezone-aware")
+    if cadence_seconds < 1:
+        raise ValueError("cadence_seconds must be >= 1")
+    epoch = int(ts.timestamp())
+    floored = epoch - (epoch % cadence_seconds)
+    return datetime.fromtimestamp(floored, tz=UTC)

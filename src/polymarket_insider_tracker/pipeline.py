@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -68,7 +68,7 @@ from polymarket_insider_tracker.training.serving import LoadedModel, load_model_
 from polymarket_insider_tracker.storage.repos import (
     CancelDTO,
     CancelRepository,
-    ERC20TransferRepository,
+    LiquidityCoverageRepository,
     LiquiditySnapshotDTO,
     LiquiditySnapshotRepository,
     MarketEntryRepository,
@@ -189,7 +189,7 @@ def _compute_book_impact_bps(
     return False, None
 
 
-class PipelineState(str, Enum):
+class PipelineState(StrEnum):
     """Pipeline lifecycle states."""
 
     STOPPED = "stopped"
@@ -434,12 +434,40 @@ class Pipeline:
                 )
                 await session.commit()
 
+        async def on_liquidity_coverage(
+            window_start: datetime,
+            window_end: datetime,
+            cadence_seconds: int,
+            pairs: list[tuple[str, str]],
+        ) -> None:
+            if not self._db_manager or not pairs:
+                return
+            async with self._db_manager.get_async_session() as session:
+                repo = LiquidityCoverageRepository(session)
+                await repo.compute_and_upsert_window(
+                    pairs=pairs,
+                    window_start=window_start,
+                    window_end=window_end,
+                    cadence_seconds=cadence_seconds,
+                )
+                await session.commit()
+
         self._metadata_sync = MarketMetadataSync(
             redis=self._redis,
             clob_client=self._clob_client,
+            sync_interval_seconds=settings.liquidity.metadata_sync_interval_seconds,
             hot_market_ttl_seconds=settings.liquidity.hot_market_ttl_seconds,
             depth_max_slippage_bps=settings.liquidity.depth_max_slippage_bps,
+            snapshot_cadence_seconds=settings.liquidity.snapshot_cadence_seconds,
+            active_sweep_interval_seconds=settings.liquidity.active_sweep_interval_seconds,
+            active_sweep_batch_size=settings.liquidity.active_sweep_batch_size,
+            orderbook_timeout_seconds=settings.liquidity.request_timeout_seconds,
+            orderbook_max_retries=settings.liquidity.request_max_retries,
+            collection_max_concurrency=settings.liquidity.collection_max_concurrency,
+            coverage_job_interval_seconds=settings.liquidity.coverage_job_interval_seconds,
+            coverage_window_hours=settings.liquidity.coverage_window_hours,
             on_liquidity_snapshot=on_liquidity_snapshot,
+            on_liquidity_coverage=on_liquidity_coverage,
         )
 
         # Rolling volume cache (Redis)

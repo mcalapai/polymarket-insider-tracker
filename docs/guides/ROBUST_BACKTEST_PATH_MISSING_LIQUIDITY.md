@@ -21,7 +21,7 @@ Where this is enforced:
 
 Important system constraints:
 - Historical liquidity snapshots are not guaranteed for all markets/assets.
-- Existing fallback (`SCAN_ALLOW_NON_HISTORICAL_BOOK_DEPTH=true`) computes depth from current orderbook, which contaminates historical backtests.
+- Present-time orderbook substitution is not part of historically pure replay behavior.
 
 Failure symptom:
 - `ScanError: Missing historical liquidity snapshot for market=... asset=...`
@@ -39,17 +39,14 @@ Target behavior after implementation:
 Policy model (explicit, deterministic):
 - `required`: fail trade/run when liquidity is missing.
 - `skip_size_signal`: continue trade processing without `size_anomaly` (default for historical scan/backtest).
-- `use_current_orderbook`: non-historical fallback (explicitly opt-in).
 
 ## 4. Step-by-Step Implementation Guide
 
 ### Step 1: Replace boolean toggle with explicit policy
 1. In `src/polymarket_insider_tracker/config.py`:
-   - Deprecate `SCAN_ALLOW_NON_HISTORICAL_BOOK_DEPTH` usage in scan logic.
    - Add `SCAN_HISTORICAL_LIQUIDITY_POLICY` enum-like setting with allowed values:
      - `required`
      - `skip_size_signal`
-     - `use_current_orderbook`
    - Set default to `skip_size_signal` for scan/backtest.
 2. Keep config parsing strict; invalid values must fail at startup.
 
@@ -61,7 +58,6 @@ Policy model (explicit, deterministic):
      - Branch by policy:
        - `required`: raise `ScanError`.
        - `skip_size_signal`: set `size_signal=None`; continue.
-       - `use_current_orderbook`: compute depth from current book; continue.
 2. Remove implicit coupling between “can’t compute liquidity” and “abort entire replay” for non-`required` policies.
 
 ### Step 3: Add first-class data quality telemetry for replay
@@ -93,13 +89,12 @@ Policy model (explicit, deterministic):
 2. In `--config-check`:
    - Validate policy value and explain implications.
 3. In docs:
-   - Clarify that `skip_size_signal` is historically pure; `use_current_orderbook` is not.
+   - Clarify that `skip_size_signal` is historically pure and default.
 
 ### Step 7: Add targeted tests
 1. Unit tests for policy branching:
    - `required` raises.
    - `skip_size_signal` continues.
-   - `use_current_orderbook` computes and continues.
 2. Integration test:
    - Seed trades without matching `liquidity_snapshots`.
    - Assert run completes and emits coverage counters.
@@ -128,7 +123,7 @@ Performance validation:
 ## 6. Rollout Plan
 1. Ship with default `skip_size_signal` in scan/backtest.
 2. Keep `required` available for strict environments.
-3. Keep `use_current_orderbook` as explicit opt-in only.
+3. Keep the policy surface minimal: `required` and `skip_size_signal`.
 4. Add release note explaining behavior change from “fail whole run” to “continue with explicit missing-input audit”.
 
 ## 7. Definition of Done
@@ -136,4 +131,3 @@ Performance validation:
 - Historical integrity is preserved by default.
 - Coverage/missing-input metrics are visible in logs and persisted outputs.
 - Tests cover all policy branches and the missing-liquidity replay path.
-
