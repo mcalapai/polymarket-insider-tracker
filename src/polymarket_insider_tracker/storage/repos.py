@@ -209,7 +209,8 @@ class TradeRepository:
             "ts": dto.ts,
         }
         now = datetime.now(UTC)
-        try:
+        bind = self.session.get_bind()
+        if bind.dialect.name == "postgresql":
             stmt = pg_insert(TradeModel).values(**values, created_at=now)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["trade_id"],
@@ -227,7 +228,7 @@ class TradeRepository:
                 },
             )
             await self.session.execute(stmt)
-        except Exception:
+        elif bind.dialect.name == "sqlite":
             sqlite_stmt = sqlite_insert(TradeModel).values(**values, created_at=now)
             sqlite_stmt = sqlite_stmt.on_conflict_do_update(
                 index_elements=["trade_id"],
@@ -245,8 +246,74 @@ class TradeRepository:
                 },
             )
             await self.session.execute(sqlite_stmt)
+        else:
+            raise RuntimeError(f"Unsupported database dialect: {bind.dialect.name}")
         await self.session.flush()
         return dto
+
+    async def upsert_many(self, dtos: list[TradeDTO]) -> None:
+        """Bulk upsert trades (idempotent ingestion)."""
+        if not dtos:
+            return
+        now = datetime.now(UTC)
+        bind = self.session.get_bind()
+        values_list: list[dict[str, object]] = []
+        for dto in dtos:
+            values_list.append(
+                {
+                    "trade_id": dto.trade_id,
+                    "market_id": dto.market_id,
+                    "asset_id": dto.asset_id,
+                    "wallet_address": dto.wallet_address.lower(),
+                    "side": dto.side,
+                    "outcome": dto.outcome,
+                    "outcome_index": dto.outcome_index,
+                    "price": dto.price,
+                    "size": dto.size,
+                    "notional_usdc": dto.notional_usdc,
+                    "ts": dto.ts,
+                    "created_at": now,
+                }
+            )
+        if bind.dialect.name == "postgresql":
+            stmt = pg_insert(TradeModel).values(values_list)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["trade_id"],
+                set_={
+                    "market_id": stmt.excluded.market_id,
+                    "asset_id": stmt.excluded.asset_id,
+                    "wallet_address": stmt.excluded.wallet_address,
+                    "side": stmt.excluded.side,
+                    "outcome": stmt.excluded.outcome,
+                    "outcome_index": stmt.excluded.outcome_index,
+                    "price": stmt.excluded.price,
+                    "size": stmt.excluded.size,
+                    "notional_usdc": stmt.excluded.notional_usdc,
+                    "ts": stmt.excluded.ts,
+                },
+            )
+            await self.session.execute(stmt)
+        elif bind.dialect.name == "sqlite":
+            sqlite_stmt = sqlite_insert(TradeModel).values(values_list)
+            sqlite_stmt = sqlite_stmt.on_conflict_do_update(
+                index_elements=["trade_id"],
+                set_={
+                    "market_id": sqlite_stmt.excluded.market_id,
+                    "asset_id": sqlite_stmt.excluded.asset_id,
+                    "wallet_address": sqlite_stmt.excluded.wallet_address,
+                    "side": sqlite_stmt.excluded.side,
+                    "outcome": sqlite_stmt.excluded.outcome,
+                    "outcome_index": sqlite_stmt.excluded.outcome_index,
+                    "price": sqlite_stmt.excluded.price,
+                    "size": sqlite_stmt.excluded.size,
+                    "notional_usdc": sqlite_stmt.excluded.notional_usdc,
+                    "ts": sqlite_stmt.excluded.ts,
+                },
+            )
+            await self.session.execute(sqlite_stmt)
+        else:
+            raise RuntimeError(f"Unsupported database dialect: {bind.dialect.name}")
+        await self.session.flush()
 
 
 @dataclass
@@ -636,6 +703,66 @@ class MarketPriceBarRepository:
         await self.session.flush()
         return MarketPriceBarDTO.from_model(model)
 
+    async def upsert_many(self, bars: list[MarketPriceBarDTO]) -> None:
+        """Bulk upsert precomputed minute bars (overwrite semantics on conflict).
+
+        Scan/backtest builds deterministic per-minute bars in-memory from the
+        fetched trade history and upserts them in bulk for performance.
+        """
+        if not bars:
+            return
+        now = datetime.now(UTC)
+        bind = self.session.get_bind()
+        values_list: list[dict[str, object]] = []
+        for b in bars:
+            values_list.append(
+                {
+                    "market_id": b.market_id,
+                    "bucket_start": b.bucket_start,
+                    "first_trade_ts": b.first_trade_ts,
+                    "last_trade_ts": b.last_trade_ts,
+                    "open_price": b.open_price,
+                    "high_price": b.high_price,
+                    "low_price": b.low_price,
+                    "close_price": b.close_price,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        if bind.dialect.name == "postgresql":
+            stmt = pg_insert(MarketPriceBarModel).values(values_list)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["market_id", "bucket_start"],
+                set_={
+                    "first_trade_ts": stmt.excluded.first_trade_ts,
+                    "last_trade_ts": stmt.excluded.last_trade_ts,
+                    "open_price": stmt.excluded.open_price,
+                    "high_price": stmt.excluded.high_price,
+                    "low_price": stmt.excluded.low_price,
+                    "close_price": stmt.excluded.close_price,
+                    "updated_at": now,
+                },
+            )
+            await self.session.execute(stmt)
+        elif bind.dialect.name == "sqlite":
+            sqlite_stmt = sqlite_insert(MarketPriceBarModel).values(values_list)
+            sqlite_stmt = sqlite_stmt.on_conflict_do_update(
+                index_elements=["market_id", "bucket_start"],
+                set_={
+                    "first_trade_ts": sqlite_stmt.excluded.first_trade_ts,
+                    "last_trade_ts": sqlite_stmt.excluded.last_trade_ts,
+                    "open_price": sqlite_stmt.excluded.open_price,
+                    "high_price": sqlite_stmt.excluded.high_price,
+                    "low_price": sqlite_stmt.excluded.low_price,
+                    "close_price": sqlite_stmt.excluded.close_price,
+                    "updated_at": now,
+                },
+            )
+            await self.session.execute(sqlite_stmt)
+        else:
+            raise RuntimeError(f"Unsupported database dialect: {bind.dialect.name}")
+        await self.session.flush()
+
     async def get_close_at_or_after(
         self,
         *,
@@ -761,6 +888,14 @@ class MarketRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def get_index_state(self) -> tuple[int, datetime | None]:
+        """Return (row_count, max_updated_at) for the markets table."""
+        result = await self.session.execute(select(sa.func.count()).select_from(MarketModel))
+        count = int(result.scalar_one())
+        result2 = await self.session.execute(select(sa.func.max(MarketModel.updated_at)))
+        max_updated_at = result2.scalar_one_or_none()
+        return count, max_updated_at
+
     async def upsert(
         self,
         *,
@@ -769,6 +904,7 @@ class MarketRepository:
         now: datetime | None = None,
     ) -> None:
         now = now or datetime.now(UTC)
+        bind = self.session.get_bind()
         values = {
             "condition_id": dto.condition_id,
             "question": dto.question,
@@ -779,7 +915,7 @@ class MarketRepository:
             "end_date": dto.end_date,
             "embedding": embedding,
         }
-        try:
+        if bind.dialect.name == "postgresql":
             stmt = pg_insert(MarketModel).values(**values, created_at=now, updated_at=now)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["condition_id"],
@@ -795,7 +931,7 @@ class MarketRepository:
                 },
             )
             await self.session.execute(stmt)
-        except Exception:
+        elif bind.dialect.name == "sqlite":
             sqlite_stmt = sqlite_insert(MarketModel).values(**values, created_at=now, updated_at=now)
             sqlite_stmt = sqlite_stmt.on_conflict_do_update(
                 index_elements=["condition_id"],
@@ -811,6 +947,85 @@ class MarketRepository:
                 },
             )
             await self.session.execute(sqlite_stmt)
+        else:
+            raise RuntimeError(f"Unsupported database dialect: {bind.dialect.name}")
+        await self.session.flush()
+
+    async def upsert_many(
+        self,
+        *,
+        items: list[tuple[MarketDTO, list[float]]],
+        now: datetime | None = None,
+    ) -> None:
+        """Bulk upsert markets (chunked at call site).
+
+        This uses a single INSERT..ON CONFLICT statement per call to keep
+        indexing scalable for large market universes.
+        """
+        if not items:
+            return
+        now = now or datetime.now(UTC)
+        bind = self.session.get_bind()
+        # Defensive: ensure no duplicate condition_ids within a single INSERT
+        # (Postgres would raise CardinalityViolationError).
+        seen: set[str] = set()
+        values_list: list[dict[str, object]] = []
+        for dto, embedding in items:
+            cid = dto.condition_id
+            if cid in seen:
+                continue
+            seen.add(cid)
+            values_list.append(
+                {
+                    "condition_id": cid,
+                    "question": dto.question,
+                    "description": dto.description,
+                    "tokens_json": dto.tokens_json,
+                    "active": dto.active,
+                    "closed": dto.closed,
+                    "end_date": dto.end_date,
+                    "embedding": embedding,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        if not values_list:
+            return
+
+        if bind.dialect.name == "postgresql":
+            stmt = pg_insert(MarketModel).values(values_list)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["condition_id"],
+                set_={
+                    "question": stmt.excluded.question,
+                    "description": stmt.excluded.description,
+                    "tokens_json": stmt.excluded.tokens_json,
+                    "active": stmt.excluded.active,
+                    "closed": stmt.excluded.closed,
+                    "end_date": stmt.excluded.end_date,
+                    "embedding": stmt.excluded.embedding,
+                    "updated_at": now,
+                },
+            )
+            await self.session.execute(stmt)
+        elif bind.dialect.name == "sqlite":
+            sqlite_stmt = sqlite_insert(MarketModel).values(values_list)
+            sqlite_stmt = sqlite_stmt.on_conflict_do_update(
+                index_elements=["condition_id"],
+                set_={
+                    "question": sqlite_stmt.excluded.question,
+                    "description": sqlite_stmt.excluded.description,
+                    "tokens_json": sqlite_stmt.excluded.tokens_json,
+                    "active": sqlite_stmt.excluded.active,
+                    "closed": sqlite_stmt.excluded.closed,
+                    "end_date": sqlite_stmt.excluded.end_date,
+                    "embedding": sqlite_stmt.excluded.embedding,
+                    "updated_at": now,
+                },
+            )
+            await self.session.execute(sqlite_stmt)
+        else:
+            raise RuntimeError(f"Unsupported database dialect: {bind.dialect.name}")
         await self.session.flush()
 
     async def search_by_embedding(

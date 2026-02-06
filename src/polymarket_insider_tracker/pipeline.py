@@ -393,9 +393,9 @@ class Pipeline:
             and settings.polymarket.clob_api_passphrase
         ):
             api_creds = ApiCreds(
-                key=settings.polymarket.clob_api_key.get_secret_value(),
-                secret=settings.polymarket.clob_api_secret.get_secret_value(),
-                passphrase=settings.polymarket.clob_api_passphrase.get_secret_value(),
+                api_key=settings.polymarket.clob_api_key.get_secret_value(),
+                api_secret=settings.polymarket.clob_api_secret.get_secret_value(),
+                api_passphrase=settings.polymarket.clob_api_passphrase.get_secret_value(),
             )
         self._clob_client = ClobClient(
             host=settings.polymarket.clob_host,

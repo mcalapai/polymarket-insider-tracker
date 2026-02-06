@@ -18,8 +18,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import TypeVar
 
 from redis.asyncio import Redis
+from py_clob_client.clob_types import ApiCreds
 
 from polymarket_insider_tracker.config import Settings
 from polymarket_insider_tracker.detector.digit_distribution import DigitDistributionDetector
@@ -43,7 +45,12 @@ from polymarket_insider_tracker.ingestor.baselines import (
     RollingHistogramCache,
     RollingHistogramConfig,
 )
-from polymarket_insider_tracker.ingestor.clob_client import ClobClient
+from polymarket_insider_tracker.ingestor.clob_client import (
+    ClobClient,
+    ClobClientError,
+    ClobClientNotFoundError,
+    RetryError,
+)
 from polymarket_insider_tracker.ingestor.flow import RollingFlowConfig, RollingWalletMarketFlowCache
 from polymarket_insider_tracker.ingestor.liquidity import compute_visible_book_depth_usdc, now_utc
 from polymarket_insider_tracker.ingestor.volume import RollingVolumeCache, RollingVolumeConfig
@@ -58,6 +65,8 @@ from polymarket_insider_tracker.storage.repos import (
     BacktestRunDTO,
     BacktestRunRepository,
     LiquiditySnapshotRepository,
+    MarketRepository,
+    MarketPriceBarDTO,
     MarketPriceBarRepository,
     TradeDTO,
     TradeRepository,
@@ -70,6 +79,8 @@ from polymarket_insider_tracker.storage.repos import (
 from polymarket_insider_tracker.training.features import build_trade_features
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -88,6 +99,11 @@ def _json_default(x: object) -> str:
     if isinstance(x, (datetime,)):
         return x.isoformat()
     return str(x)
+
+def _chunked(items: list[T], size: int) -> list[list[T]]:
+    if size < 1:
+        raise ValueError("chunk size must be >= 1")
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 async def run_scan(
@@ -145,7 +161,30 @@ async def run_scan(
             ),
         )
 
-        clob = ClobClient(host=settings.polymarket.clob_host, chain_id=settings.polymarket.clob_chain_id)
+        private_key = (
+            settings.polymarket.clob_private_key.get_secret_value()
+            if settings.polymarket.clob_private_key
+            else None
+        )
+        api_creds: ApiCreds | None = None
+        if (
+            settings.polymarket.clob_api_key
+            and settings.polymarket.clob_api_secret
+            and settings.polymarket.clob_api_passphrase
+        ):
+            api_creds = ApiCreds(
+                api_key=settings.polymarket.clob_api_key.get_secret_value(),
+                api_secret=settings.polymarket.clob_api_secret.get_secret_value(),
+                api_passphrase=settings.polymarket.clob_api_passphrase.get_secret_value(),
+            )
+        clob = ClobClient(
+            host=settings.polymarket.clob_host,
+            chain_id=settings.polymarket.clob_chain_id,
+            private_key=private_key,
+            api_creds=api_creds,
+            signature_type=settings.polymarket.clob_signature_type,
+            funder=settings.polymarket.clob_funder,
+        )
 
         embedder = SentenceTransformerEmbeddingProvider(
             config=EmbeddingConfig(
@@ -156,13 +195,53 @@ async def run_scan(
         )
 
         async with db.get_async_session() as session:
-            indexer = MarketIndexer(clob_client=clob, embedder=embedder)
-            indexed = await indexer.run_once(session=session)
-            await session.commit()
-            logger.info("Indexed %d markets for semantic search", indexed)
+            repo = MarketRepository(session)
+            row_count, max_updated_at = await repo.get_index_state()
+            now = datetime.now(UTC)
+            should_index = settings.scan.index_force or row_count == 0 or max_updated_at is None
+            if not should_index and settings.scan.index_max_age_hours == 0:
+                should_index = True
+            if not should_index and max_updated_at is not None:
+                age = now - max_updated_at
+                should_index = age > timedelta(hours=settings.scan.index_max_age_hours)
+
+            if should_index:
+                logger.info(
+                    "Indexing markets for semantic search (existing_rows=%d last_updated_at=%s active_only=%s)",
+                    row_count,
+                    max_updated_at.isoformat() if max_updated_at else None,
+                    settings.scan.index_active_only,
+                )
+                from polymarket_insider_tracker.scan.market_indexer import MarketIndexerConfig
+
+                indexer = MarketIndexer(
+                    clob_client=clob,
+                    embedder=embedder,
+                    config=MarketIndexerConfig(
+                        active_only=settings.scan.index_active_only,
+                        chunk_size=settings.scan.index_chunk_size,
+                        embed_batch_size=settings.scan.index_embed_batch_size,
+                        commit_every_chunks=settings.scan.index_commit_every_chunks,
+                    ),
+                )
+                indexed = await indexer.run_once(session=session)
+                logger.info("Market index updated (indexed=%d)", indexed)
+            else:
+                logger.info(
+                    "Skipping market indexing (rows=%d last_updated_at=%s max_age_hours=%d)",
+                    row_count,
+                    max_updated_at.isoformat() if max_updated_at else None,
+                    settings.scan.index_max_age_hours,
+                )
 
         async with db.get_async_session() as session:
-            search = MarketSearch(embedder=embedder, config=MarketSearchConfig(top_k=settings.scan.top_k_markets))
+            search = MarketSearch(
+                embedder=embedder,
+                config=MarketSearchConfig(
+                    top_k=settings.scan.top_k_markets,
+                    active_only=settings.scan.index_active_only,
+                ),
+            )
             markets = await search.search(session=session, query=query)
 
         if not markets:
@@ -172,34 +251,85 @@ async def run_scan(
 
         # Fetch + persist trades
         trades: list[TradeDTO] = []
+        skipped_markets = 0
         async with db.get_async_session() as session:
             trade_repo = TradeRepository(session)
             price_repo = MarketPriceBarRepository(session)
 
             for m in markets:
-                raw_trades = await asyncio.to_thread(clob.get_market_trades, m.condition_id)
+                try:
+                    raw_trades = await asyncio.to_thread(clob.get_market_trades, m.condition_id)
+                except ClobClientNotFoundError as e:
+                    skipped_markets += 1
+                    logger.warning("Skipping market with no trades endpoint (market=%s): %s", m.condition_id, e)
+                    continue
+                except (ClobClientError, RetryError) as e:
+                    skipped_markets += 1
+                    logger.warning("Skipping market trades fetch failure (market=%s): %s", m.condition_id, e)
+                    continue
                 # Bound work deterministically.
                 raw_trades = [t for t in raw_trades if t.timestamp >= cutoff]
                 raw_trades = sorted(raw_trades, key=lambda t: t.timestamp)[: settings.scan.max_trades_per_market]
+                trade_dtos: list[TradeDTO] = []
+                bars: dict[tuple[str, datetime], MarketPriceBarDTO] = {}
                 for t in raw_trades:
-                    dto = TradeDTO(
-                        trade_id=t.trade_id,
-                        market_id=t.market_id,
-                        asset_id=t.asset_id,
-                        wallet_address=t.wallet_address,
-                        side=t.side,
-                        outcome=t.outcome,
-                        outcome_index=t.outcome_index,
-                        price=t.price,
-                        size=t.size,
-                        notional_usdc=t.notional_value,
-                        ts=t.timestamp,
+                    trade_dtos.append(
+                        TradeDTO(
+                            trade_id=t.trade_id,
+                            market_id=t.market_id,
+                            asset_id=t.asset_id,
+                            wallet_address=t.wallet_address,
+                            side=t.side,
+                            outcome=t.outcome,
+                            outcome_index=t.outcome_index,
+                            price=t.price,
+                            size=t.size,
+                            notional_usdc=t.notional_value,
+                            ts=t.timestamp,
+                        )
                     )
-                    await trade_repo.upsert(dto)
-                    await price_repo.upsert_trade_price(market_id=t.market_id, ts=t.timestamp, price=t.price)
-                    trades.append(dto)
+
+                    bucket = t.timestamp.replace(second=0, microsecond=0)
+                    key = (t.market_id, bucket)
+                    existing = bars.get(key)
+                    if existing is None:
+                        bars[key] = MarketPriceBarDTO(
+                            market_id=t.market_id,
+                            bucket_start=bucket,
+                            first_trade_ts=t.timestamp,
+                            last_trade_ts=t.timestamp,
+                            open_price=t.price,
+                            high_price=t.price,
+                            low_price=t.price,
+                            close_price=t.price,
+                        )
+                    else:
+                        if t.timestamp < existing.first_trade_ts:
+                            existing.first_trade_ts = t.timestamp
+                            existing.open_price = t.price
+                        if t.timestamp > existing.last_trade_ts:
+                            existing.last_trade_ts = t.timestamp
+                            existing.close_price = t.price
+                        if t.price > existing.high_price:
+                            existing.high_price = t.price
+                        if t.price < existing.low_price:
+                            existing.low_price = t.price
+
+                # Bulk persist in bounded chunks.
+                for chunk in _chunked(trade_dtos, 5_000):
+                    await trade_repo.upsert_many(chunk)
+                for chunk in _chunked(list(bars.values()), 10_000):
+                    await price_repo.upsert_many(chunk)
+
+                trades.extend(trade_dtos)
 
             await session.commit()
+
+        if not trades:
+            raise ScanError(
+                "No trades fetched for retrieved markets "
+                f"(retrieved_markets={len(markets)} skipped_markets={skipped_markets})."
+            )
 
         # Replay in timestamp order.
         trades.sort(key=lambda t: t.ts)

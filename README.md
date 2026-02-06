@@ -154,7 +154,7 @@ The development stack includes:
 
 | Service | Port | Description |
 |---------|------|-------------|
-| PostgreSQL 15 | 5432 | Primary database |
+| PostgreSQL 15 (pgvector) | `${POSTGRES_PORT:-5432}` | Primary database + `pgvector` extension for `scan` |
 | Redis 7 | 6379 | Caching and pub/sub |
 | Adminer | 8080 | Database admin UI (optional) |
 | RedisInsight | 5540 | Redis admin UI (optional) |
@@ -187,7 +187,7 @@ POLYMARKET_CLOB_MARKET_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/mark
 POLYMARKET_CLOB_HOST=https://clob.polymarket.com
 
 # Database (async SQLAlchemy)
-DATABASE_URL=postgresql+asyncpg://tracker:dev_password@localhost:5432/polymarket_tracker
+DATABASE_URL=postgresql+asyncpg://tracker:dev_password@localhost:${POSTGRES_PORT:-5432}/polymarket_tracker
 
 # Alert destinations (optional)
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...

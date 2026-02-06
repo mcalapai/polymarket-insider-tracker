@@ -7,6 +7,7 @@ import pytest
 
 from polymarket_insider_tracker.ingestor.clob_client import (
     ClobClient,
+    ClobClientNotFoundError,
     RateLimiter,
     RetryError,
     with_retry,
@@ -132,9 +133,79 @@ class TestClobClient:
 
         client2 = ClobClient(
             private_key="0x" + "1" * 64,
-            api_creds=ApiCreds(key="k", secret="s", passphrase="p"),
+            api_creds=ApiCreds(api_key="k", api_secret="s", api_passphrase="p"),
         )
         assert client2.is_level2_configured is True
+
+    def test_get_market_trades_prefers_level2(self, mock_base_client: MagicMock) -> None:
+        """Market trade fetch should use L2 trades endpoint when configured."""
+        mock_base_client.get_trades.return_value = [
+            {
+                "id": "trade_1",
+                "market": "0xabc",
+                "maker_address": "0xmaker",
+                "asset_id": "asset_1",
+                "side": "BUY",
+                "price": "0.42",
+                "size": "100",
+                "timestamp": 1704067200,
+            }
+        ]
+
+        client = ClobClient(
+            private_key="0x" + "1" * 64,
+            api_creds=ApiCreds(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        trades = client.get_market_trades("0xabc")
+
+        assert len(trades) == 1
+        assert trades[0].market_id == "0xabc"
+        assert trades[0].trade_id == "trade_1"
+        assert trades[0].wallet_address == "0xmaker"
+        assert mock_base_client.get_trades.call_count == 1
+        assert mock_base_client.get_market_trades_events.call_count == 0
+
+    def test_get_market_trades_falls_back_to_events(self, mock_base_client: MagicMock) -> None:
+        """If L2 returns no trades, fallback to public events endpoint."""
+        mock_base_client.get_trades.return_value = []
+        mock_base_client.get_market_trades_events.return_value = [
+            {
+                "transactionHash": "0xtradehash",
+                "conditionId": "0xabc",
+                "proxyWallet": "0xwallet",
+                "asset": "asset_1",
+                "side": "BUY",
+                "price": "0.25",
+                "size": "20",
+                "timestamp": 1704067200,
+            }
+        ]
+
+        client = ClobClient(
+            private_key="0x" + "1" * 64,
+            api_creds=ApiCreds(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        trades = client.get_market_trades("0xabc")
+
+        assert len(trades) == 1
+        assert trades[0].trade_id == "0xtradehash"
+        assert mock_base_client.get_trades.call_count == 1
+        assert mock_base_client.get_market_trades_events.call_count == 1
+
+    def test_get_market_trades_raises_not_found_when_no_sources_have_data(
+        self, mock_base_client: MagicMock
+    ) -> None:
+        """No data from either source should raise ClobClientNotFoundError."""
+        mock_base_client.get_trades.return_value = []
+        mock_base_client.get_market_trades_events.return_value = []
+
+        client = ClobClient(
+            private_key="0x" + "1" * 64,
+            api_creds=ApiCreds(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+
+        with pytest.raises(ClobClientNotFoundError, match="No trades available"):
+            client.get_market_trades("0xabc")
 
     def test_health_check_success(self, mock_base_client: MagicMock) -> None:
         """Test health check returns True when API responds OK."""
@@ -191,6 +262,22 @@ class TestClobClient:
             "data": [
                 {"condition_id": "0x1", "closed": False},
                 {"condition_id": "0x2", "closed": True},
+            ],
+            "next_cursor": "LTE=",
+        }
+
+        client = ClobClient()
+        markets = client.get_markets(active_only=True)
+
+        assert len(markets) == 1
+        assert markets[0].condition_id == "0x1"
+
+    def test_get_markets_filters_inactive(self, mock_base_client: MagicMock) -> None:
+        """Test that inactive markets are filtered when active_only=True."""
+        mock_base_client.get_simplified_markets.return_value = {
+            "data": [
+                {"condition_id": "0x1", "active": True, "closed": False},
+                {"condition_id": "0x2", "active": False, "closed": False},
             ],
             "next_cursor": "LTE=",
         }

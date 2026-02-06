@@ -3,12 +3,14 @@
 import asyncio
 import logging
 import time
+from collections.abc import Iterator
 from collections.abc import Callable
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
 
 from py_clob_client.client import ClobClient as BaseClobClient
 from py_clob_client.clob_types import ApiCreds, BookParams, TradeParams
+from py_clob_client.exceptions import PolyApiException
 
 from polymarket_insider_tracker.ingestor.models import Market, Orderbook, TradeEvent
 
@@ -121,6 +123,14 @@ class ClobClientError(Exception):
     """Base exception for ClobClient errors."""
 
 
+class ClobClientNotFoundError(ClobClientError):
+    """Raised when a requested resource does not exist (e.g., 404)."""
+
+
+class ClobClientTransientError(ClobClientError):
+    """Raised for retryable/transient errors (e.g., 429/5xx, network issues)."""
+
+
 class ClobClient:
     """Wrapper around py-clob-client with rate limiting and retry logic.
 
@@ -202,6 +212,18 @@ class ClobClient:
         return wrapper
 
     @with_retry()
+    def _get_simplified_markets_page(self, cursor: str | None = None) -> dict[str, Any]:
+        """Fetch a single simplified-markets page (with rate limiting + retries)."""
+        self._rate_limiter.acquire_sync()
+        if cursor:
+            resp = self._client.get_simplified_markets(cursor)
+        else:
+            resp = self._client.get_simplified_markets()
+        if not isinstance(resp, dict):
+            raise ClobClientError("Unexpected simplified markets response shape")
+        return resp
+
+    @with_retry()
     def get_markets(self, active_only: bool = True) -> list[Market]:
         """Fetch all markets from the CLOB.
 
@@ -211,34 +233,32 @@ class ClobClient:
         Returns:
             List of Market objects.
         """
-        self._rate_limiter.acquire_sync()
+        markets = list(self.iter_markets(active_only=active_only))
+        logger.debug("Fetched %d markets", len(markets))
+        return markets
 
-        all_markets: list[Market] = []
+    def iter_markets(self, *, active_only: bool = True) -> Iterator[Market]:
+        """Iterate markets from the CLOB (streaming).
+
+        This is the production-friendly variant used by scan/backtest indexing.
+        It yields markets incrementally so callers can persist and embed in
+        bounded chunks without holding the full market universe in memory.
+        """
         cursor: str | None = None
-
         while True:
-            if cursor:
-                response = self._client.get_simplified_markets(cursor)
-            else:
-                response = self._client.get_simplified_markets()
+            response = self._get_simplified_markets_page(cursor)
 
             data = response.get("data", [])
             for market_data in data:
                 market = Market.from_dict(market_data)
-                if active_only and market.closed:
+                if active_only and (market.closed or not market.active):
                     continue
-                all_markets.append(market)
+                yield market
 
             next_cursor = response.get("next_cursor")
             if not next_cursor or next_cursor == "LTE=":
-                break
+                return
             cursor = next_cursor
-
-            # Rate limit between pagination requests
-            self._rate_limiter.acquire_sync()
-
-        logger.debug("Fetched %d markets", len(all_markets))
-        return all_markets
 
     @with_retry()
     def get_market(self, condition_id: str) -> Market:
@@ -299,30 +319,113 @@ class ClobClient:
         except Exception as e:
             raise ClobClientError(f"Failed to fetch trades: {e}") from e
 
-    @with_retry()
-    def get_market_trades(self, condition_id: str) -> list[TradeEvent]:
-        """Fetch historical trade events for a market (public endpoint)."""
-        self._rate_limiter.acquire_sync()
-        try:
-            resp = self._client.get_market_trades_events(condition_id)
-        except Exception as e:
-            raise ClobClientError(f"Failed to fetch market trades for {condition_id}: {e}") from e
-
+    def _normalize_trade_events(self, *, resp: Any, source: str) -> list[TradeEvent]:
         items: Any = resp
         if isinstance(resp, dict) and isinstance(resp.get("data"), list):
             items = resp["data"]
         if not isinstance(items, list):
-            raise ClobClientError("Unexpected market trades response shape")
+            raise ClobClientError(f"Unexpected {source} trade response shape")
 
         out: list[TradeEvent] = []
+        skipped = 0
         for raw in items:
             if not isinstance(raw, dict):
+                skipped += 1
                 continue
             trade = TradeEvent.from_websocket_message(raw)
             if not (trade.trade_id and trade.market_id and trade.wallet_address):
-                raise ClobClientError("Market trades response is missing required trade identifiers")
+                skipped += 1
+                continue
             out.append(trade)
+        if skipped:
+            logger.debug("Skipped %d malformed trades from %s", skipped, source)
+        if items and not out:
+            raise ClobClientError(f"{source} returned trades but none had required identifiers")
         return out
+
+    def _get_market_trades_events(self, condition_id: str) -> list[TradeEvent]:
+        """Fetch historical trades from public market events endpoint."""
+        self._rate_limiter.acquire_sync()
+        try:
+            resp = self._client.get_market_trades_events(condition_id)
+        except PolyApiException as e:
+            status = getattr(e, "status_code", None)
+            if status == 404:
+                raise ClobClientNotFoundError(
+                    f"Market trades endpoint returned 404 for {condition_id}"
+                ) from e
+            if status in RETRY_STATUS_CODES:
+                raise ClobClientTransientError(
+                    f"Failed to fetch market trades for {condition_id}: {e}"
+                ) from e
+            raise ClobClientError(f"Failed to fetch market trades for {condition_id}: {e}") from e
+        except Exception as e:
+            raise ClobClientTransientError(f"Failed to fetch market trades for {condition_id}: {e}") from e
+        return self._normalize_trade_events(resp=resp, source="live-activity/events")
+
+    def _get_market_trades_l2(self, condition_id: str) -> list[TradeEvent]:
+        """Fetch historical trades from Level-2 authenticated trades endpoint."""
+        self._require_level2()
+        self._rate_limiter.acquire_sync()
+        params = TradeParams(market=condition_id)
+        try:
+            resp = self._client.get_trades(params=params)
+        except PolyApiException as e:
+            status = getattr(e, "status_code", None)
+            if status == 404:
+                raise ClobClientNotFoundError(f"Level-2 trades endpoint returned 404 for {condition_id}") from e
+            if status in RETRY_STATUS_CODES:
+                raise ClobClientTransientError(
+                    f"Failed to fetch Level-2 market trades for {condition_id}: {e}"
+                ) from e
+            raise ClobClientError(f"Failed to fetch Level-2 market trades for {condition_id}: {e}") from e
+        except Exception as e:
+            raise ClobClientTransientError(
+                f"Failed to fetch Level-2 market trades for {condition_id}: {e}"
+            ) from e
+        return self._normalize_trade_events(resp=resp, source="data/trades")
+
+    @with_retry(retry_on=(ClobClientTransientError,))
+    def get_market_trades(self, condition_id: str) -> list[TradeEvent]:
+        """Fetch historical market trades via deterministic source selection.
+
+        Strategy:
+        1) If Level-2 auth is configured, use `/data/trades?market=...` (full history).
+        2) Fall back to public `/live-activity/events/{condition_id}` when needed.
+        """
+        attempted: list[str] = []
+        terminal_error: ClobClientError | None = None
+
+        if self.is_level2_configured:
+            try:
+                l2_trades = self._get_market_trades_l2(condition_id)
+                if l2_trades:
+                    return l2_trades
+                attempted.append("data/trades:empty")
+            except ClobClientNotFoundError:
+                attempted.append("data/trades:404")
+            except ClobClientError as e:
+                attempted.append("data/trades:error")
+                terminal_error = e
+
+        try:
+            events_trades = self._get_market_trades_events(condition_id)
+            if events_trades:
+                return events_trades
+            attempted.append("live-activity/events:empty")
+        except ClobClientNotFoundError:
+            attempted.append("live-activity/events:404")
+        except ClobClientError as e:
+            attempted.append("live-activity/events:error")
+            if terminal_error is None:
+                terminal_error = e
+
+        if terminal_error is not None:
+            raise terminal_error
+        details = ", ".join(attempted) if attempted else "no sources attempted"
+        raise ClobClientNotFoundError(
+            f"No trades available for {condition_id} (attempts: {details})"
+        )
 
     @with_retry()
     def get_orderbooks(self, token_ids: list[str]) -> list[Orderbook]:

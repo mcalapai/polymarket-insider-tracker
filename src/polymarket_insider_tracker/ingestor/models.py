@@ -182,31 +182,61 @@ class TradeEvent:
         Returns:
             TradeEvent instance.
         """
-        # Parse timestamp - activity feeds may use seconds (RTDS) or milliseconds (CLOB).
-        raw_timestamp = data.get("timestamp", 0)
+        # Parse timestamp from either RTDS/CLOB event payloads or L2 trade-history payloads.
+        raw_timestamp = data.get("timestamp", data.get("time", 0))
+        timestamp = datetime.now(UTC)
         if isinstance(raw_timestamp, (int, float)):
             ts_f = float(raw_timestamp)
             if ts_f > 1e12:
                 ts_f /= 1000.0
             timestamp = datetime.fromtimestamp(ts_f, tz=UTC)
-        else:
-            timestamp = datetime.now(UTC)
+        elif isinstance(raw_timestamp, str):
+            with contextlib.suppress(ValueError):
+                parsed_ts = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+                if parsed_ts.tzinfo is None:
+                    parsed_ts = parsed_ts.replace(tzinfo=UTC)
+                timestamp = parsed_ts.astimezone(UTC)
 
         # Parse side - normalize to uppercase
         side_raw = str(data.get("side", "BUY")).upper()
         side: Literal["BUY", "SELL"] = "BUY" if side_raw == "BUY" else "SELL"
 
+        market_id = str(
+            data.get("conditionId")
+            or data.get("condition_id")
+            or data.get("market")
+            or data.get("market_id")
+            or ""
+        )
+        trade_id = str(
+            data.get("transactionHash")
+            or data.get("transaction_hash")
+            or data.get("id")
+            or ""
+        )
+        wallet_address = str(
+            data.get("proxyWallet")
+            or data.get("proxy_wallet")
+            or data.get("maker_address")
+            or data.get("makerAddress")
+            or data.get("taker_address")
+            or data.get("takerAddress")
+            or ""
+        )
+        asset_id = str(data.get("asset") or data.get("asset_id") or data.get("assetId") or "")
+        outcome_index_raw = data.get("outcomeIndex", data.get("outcome_index", 0))
+
         return cls(
-            market_id=str(data.get("conditionId", "")),
-            trade_id=str(data.get("transactionHash", "")),
-            wallet_address=str(data.get("proxyWallet", "")),
+            market_id=market_id,
+            trade_id=trade_id,
+            wallet_address=wallet_address,
             side=side,
             outcome=str(data.get("outcome", "")),
-            outcome_index=int(data.get("outcomeIndex", 0)),
-            price=Decimal(str(data.get("price", 0))),
-            size=Decimal(str(data.get("size", 0))),
+            outcome_index=int(outcome_index_raw),
+            price=Decimal(str(data.get("price", data.get("avg_price", 0)))),
+            size=Decimal(str(data.get("size", data.get("amount", 0)))),
             timestamp=timestamp,
-            asset_id=str(data.get("asset", "")),
+            asset_id=asset_id,
             market_slug=str(data.get("slug", "")),
             event_slug=str(data.get("eventSlug", "")),
             event_title=str(data.get("title", "")),

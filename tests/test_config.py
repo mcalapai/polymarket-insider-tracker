@@ -314,10 +314,30 @@ class TestSettings:
         """Test scan/train validation requires embedding model."""
         with patch.dict(
             os.environ,
-            {"DATABASE_URL": "postgresql://user:pass@localhost/db"},
+            {
+                "DATABASE_URL": "postgresql://user:pass@localhost/db",
+                "SCAN_EMBEDDING_MODEL": "",
+            },
+            clear=True,
         ):
             settings = Settings()
             with pytest.raises(ValueError, match="SCAN_EMBEDDING_MODEL"):
+                settings.validate_requirements(command="scan")
+
+    def test_validate_requirements_scan_requires_level2_credentials(self) -> None:
+        """Historical scan requires Level-2 CLOB credentials."""
+        with patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "postgresql://user:pass@localhost/db",
+                "SCAN_EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+                "SCAN_EMBEDDING_DIM": "384",
+                "POLYMARKET_CLOB_PRIVATE_KEY": "",
+            },
+            clear=True,
+        ):
+            settings = Settings()
+            with pytest.raises(ValueError, match="POLYMARKET_CLOB_PRIVATE_KEY"):
                 settings.validate_requirements(command="scan")
 
     def test_redacted_summary(self) -> None:

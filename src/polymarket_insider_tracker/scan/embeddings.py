@@ -40,15 +40,21 @@ class SentenceTransformerEmbeddingProvider:
         vecs = self.embed_many([text])
         return vecs[0]
 
-    def embed_many(self, texts: list[str]) -> list[list[float]]:
+    def embed_many(self, texts: list[str], *, batch_size: int | None = None) -> list[list[float]]:
         if not texts:
             return []
         try:
-            vectors = self._model.encode(
-                texts,
-                normalize_embeddings=self._cfg.normalize,
-                show_progress_bar=False,
-            )
+            kwargs: dict[str, object] = {
+                "normalize_embeddings": self._cfg.normalize,
+                "show_progress_bar": False,
+            }
+            # sentence-transformers expects an int; passing None can crash in tqdm/range.
+            if batch_size is not None:
+                if batch_size < 1:
+                    raise ValueError("batch_size must be >= 1")
+                kwargs["batch_size"] = batch_size
+
+            vectors = self._model.encode(texts, **kwargs)
         except Exception as e:
             raise EmbeddingProviderError(f"Embedding failed: {e}") from e
 
@@ -61,4 +67,3 @@ class SentenceTransformerEmbeddingProvider:
                 )
             out.append(row)
         return out
-

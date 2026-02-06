@@ -564,6 +564,46 @@ class ScanSettings(BaseSettings):
         description="Weight for PreMoveSignal when ranking scan/backtest results",
     )
 
+    # Market indexing controls (operational; affects scan runtime/cost).
+    index_force: bool = Field(
+        default=False,
+        alias="SCAN_INDEX_FORCE",
+        description="Force a full market (re)index on scan start",
+    )
+    index_max_age_hours: int = Field(
+        default=24,
+        alias="SCAN_INDEX_MAX_AGE_HOURS",
+        ge=0,
+        le=24 * 365,
+        description="Skip market reindex if existing index is newer than this age; 0 means always reindex",
+    )
+    index_active_only: bool = Field(
+        default=False,
+        alias="SCAN_INDEX_ACTIVE_ONLY",
+        description="If true, only index active markets (faster, but excludes closed markets)",
+    )
+    index_chunk_size: int = Field(
+        default=1024,
+        alias="SCAN_INDEX_CHUNK_SIZE",
+        ge=64,
+        le=50_000,
+        description="Market indexing chunk size (embed + DB upsert per chunk)",
+    )
+    index_embed_batch_size: int = Field(
+        default=64,
+        alias="SCAN_INDEX_EMBED_BATCH_SIZE",
+        ge=1,
+        le=4096,
+        description="SentenceTransformer encode batch size (controls memory/throughput)",
+    )
+    index_commit_every_chunks: int = Field(
+        default=10,
+        alias="SCAN_INDEX_COMMIT_EVERY_CHUNKS",
+        ge=1,
+        le=1000,
+        description="Commit every N chunks during indexing to avoid long transactions",
+    )
+
     artifacts_dir: Path = Field(
         default=Path("artifacts"),
         alias="SCAN_ARTIFACTS_DIR",
@@ -852,10 +892,8 @@ class Settings(BaseSettings):
             if not self.scan.embedding_dim:
                 raise ValueError("SCAN_EMBEDDING_DIM is required for historical scan/training")
 
-        # L2 auth is required for order attribution and for full historical trade fetches.
-        needs_level2 = False
-        if command == "run" and self.orders.enabled:
-            needs_level2 = True
+        # L2 auth is required for order attribution and full historical scan trade fetches.
+        needs_level2 = command == "scan" or (command == "run" and self.orders.enabled)
 
         if needs_level2:
             if not self.polymarket.clob_private_key:
