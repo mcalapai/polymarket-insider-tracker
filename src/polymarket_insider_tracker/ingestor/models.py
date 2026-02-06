@@ -254,6 +254,11 @@ class TradeEvent:
         """Return True if this is a sell trade."""
         return self.side == "SELL"
 
+    @property
+    def notional_value(self) -> Decimal:
+        """Return the notional value of the trade (price * size)."""
+        return self.price * self.size
+
 
 @dataclass(frozen=True)
 class ClobPriceChange:
@@ -340,12 +345,6 @@ class ClobBookEvent:
             bids=bids,
             asks=asks,
         )
-
-    @property
-    def notional_value(self) -> Decimal:
-        """Return the notional value of the trade (price * size)."""
-        return self.price * self.size
-
 
 @dataclass(frozen=True)
 class MarketMetadata:
